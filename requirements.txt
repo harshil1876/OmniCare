@@ -1,0 +1,12 @@
+streamlit
+pandas
+plotly
+langchain
+langchain-community
+chromadb
+prophet
+prefect
+faiss-cpu
+google-generativeai
+numpy<2
+sentence-transformers
