@@ -3,6 +3,7 @@ pandas
 plotly
 langchain
 langchain-community
+langchain-experimental
 chromadb
 prophet
 prefect
@@ -10,3 +11,5 @@ faiss-cpu
 google-generativeai
 numpy<2
 sentence-transformers
+langchain-ollama
+tabulate
