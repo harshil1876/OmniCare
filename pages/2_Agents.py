@@ -1,704 +1,645 @@
 import streamlit as st
 from langchain_experimental.agents import create_pandas_dataframe_agent
 from langchain_ollama.llms import OllamaLLM
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain.agents import AgentType
 from langchain_community.callbacks.streamlit import StreamlitCallbackHandler
 from langchain.schema import OutputParserException
+from dotenv import load_dotenv
 import pandas as pd
 import os
 import re
 
-# Initialize the LLM with parameters optimized for agent efficiency
-llm = OllamaLLM(
-    model="llama2:latest",
-    temperature=0,  # Most deterministic for consistent results
-    num_predict=400,  # Enough tokens for detailed analysis but not too much
-    top_p=0.9,
-    repeat_penalty=1.1,
-    # Optimize for faster response times
-    num_ctx=2048,  # Reasonable context window
-    top_k=20,  # Reduce top_k for faster generation
-)
+# Load environment variables from .env
+load_dotenv()
 
-def preprocess_query_for_agent(query, df):
-    """Enhanced preprocessing with explicit ReAct format guidance"""
+# Initialize both LLMs
+@st.cache_resource
+def initialize_llms():
+    """Initialize both Ollama and Gemini LLMs with error handling"""
+    ollama_llm = None
+    gemini_llm = None
+    
+    try:
+        # Lightweight Ollama for basic tasks
+        ollama_llm = OllamaLLM(
+            model="llama2:latest",
+            temperature=0,
+            num_predict=200,  # Short responses for basic queries
+            top_p=0.9,
+            repeat_penalty=1.1,
+            num_ctx=1024,  # Smaller context for efficiency
+            top_k=20,
+        )
+        st.success("🦙 Ollama LLM initialized")
+    except Exception as e:
+        st.warning(f"⚠️ Ollama initialization failed: {str(e)}")
+    
+    try:
+        # ✅ Load Gemini API key from .env
+        gemini_api_key = os.getenv("GEMINI_API_KEY")
+        
+        if gemini_api_key:
+            gemini_llm = ChatGoogleGenerativeAI(
+                model="gemini-2.5-pro",
+                google_api_key=gemini_api_key,
+                temperature=0.1,
+                convert_system_message_to_human=True
+            )
+            st.success("💎 Gemini LLM initialized")
+        else:
+            st.warning("⚠️ Gemini API key not found. Please set GEMINI_API_KEY in your .env file.")
+            
+    except Exception as e:
+        st.warning(f"⚠️ Gemini initialization failed: {str(e)}")
+    
+    return ollama_llm, gemini_llm
+
+def classify_query_complexity(query):
+    """Classify query as BASIC, MODERATE, or COMPLEX"""
     query_lower = query.lower()
     
-    # Add explicit format instructions to guide the LLM
-    format_instruction = """
-IMPORTANT: You must use the python_repl_ast tool to execute code. Follow this format:
-
-Action: python_repl_ast
-Action Input: df.head()
-
-"""
+    # BASIC queries - use Ollama (fast, local)
+    basic_indicators = [
+        "head", "first", "show", "display", "columns", "shape", "size", 
+        "describe", "info", "summary", "list", "what are", "how many"
+    ]
     
-    # Handle visualization requests
-    if any(viz_word in query_lower for viz_word in ["plot", "graph", "chart", "visualize", "show"]):
-        return f"{format_instruction}Create a visualization to answer: {query}. Use python_repl_ast tool with matplotlib or pandas plotting."
+    # COMPLEX queries - use Gemini (advanced reasoning)
+    complex_indicators = [
+        "analyze", "insights", "trends", "patterns", "correlations", 
+        "predictions", "recommendations", "optimize", "compare", "contrast",
+        "what if", "scenario", "forecast", "model", "relationship",
+        "anomal", "outlier", "cluster", "segment", "classify"
+    ]
     
-    # Handle analysis requests
-    elif any(analysis_word in query_lower for analysis_word in ["analyze", "analysis", "insights", "trends", "patterns"]):
-        return f"{format_instruction}Perform analysis to answer: {query}. Use python_repl_ast tool with pandas operations."
+    # MODERATE queries - try Ollama first, fallback to Gemini
+    moderate_indicators = [
+        "total", "sum", "average", "mean", "max", "min", "count",
+        "group by", "filter", "where", "sort", "rank", "top",
+        "calculate", "compute", "find", "search", "get"
+    ]
     
-    # Handle summary requests
-    elif any(summary_word in query_lower for summary_word in ["summary", "summarize", "overview", "describe"]):
-        return f"{format_instruction}Provide summary for: {query}. Use python_repl_ast tool with pandas describe() and other functions."
+    # Time-based or conditional complexity
+    time_complexity = any(word in query_lower for word in ["on", "between", "during", "when", "before", "after"])
+    conditional_complexity = any(word in query_lower for word in ["if", "where", "condition", "criteria"])
+    multiple_operations = query_lower.count("and") > 1 or query_lower.count("or") > 1
     
-    # Handle specific date queries with explicit code example
-    elif "total sales" in query_lower and any(date in query for date in ["2023", "2024", "20"]):
-        import re
-        dates = re.findall(r'\d{4}-\d{2}-\d{2}', query)
-        if dates:
-            return f"""{format_instruction}Calculate total sales for {dates[0]}. Use python_repl_ast tool like this example:
-
-Action: python_repl_ast  
-Action Input: df[df['Date'] == '{dates[0]}']['Sales'].sum()
-"""
-    
-    # Handle general aggregation with examples
-    elif "total" in query_lower:
-        return f"""{format_instruction}Calculate totals to answer: {query}. Use python_repl_ast tool with pandas sum() function."""
-    
-    elif "average" in query_lower or "mean" in query_lower:
-        return f"""{format_instruction}Calculate average to answer: {query}. Use python_repl_ast tool with pandas mean() function."""
-    
-    # For simple queries, provide very explicit guidance
+    # Classification logic
+    if any(indicator in query_lower for indicator in complex_indicators):
+        return "COMPLEX"
+    elif any(indicator in query_lower for indicator in basic_indicators):
+        return "BASIC"
+    elif (time_complexity and conditional_complexity) or multiple_operations:
+        return "COMPLEX"
+    elif any(indicator in query_lower for indicator in moderate_indicators):
+        return "MODERATE"
     else:
-        return f"""{format_instruction}Answer this question: {query}
+        # Default classification based on query length and complexity
+        if len(query.split()) > 10 or len(re.findall(r'[0-9]{4}', query)) > 1:
+            return "COMPLEX"
+        else:
+            return "BASIC"
 
-Use the python_repl_ast tool to execute pandas code. Example:
-Action: python_repl_ast
-Action Input: df.head()
-"""
-
-def create_robust_agent_with_retries(df, max_retries=1):
-    """Create agent with explicit ReAct format instructions"""
+def create_ollama_agent(df):
+    """Create lightweight Ollama agent for basic queries"""
     try:
-        st.write("🔧 Creating intelligent pandas agent with ReAct guidance...")
-        
-        # Create custom prompt template that emphasizes tool usage
-        from langchain.prompts import PromptTemplate
-        
-        # Try to create agent with explicit tool guidance
+        ollama_llm, _ = initialize_llms()
+        if not ollama_llm:
+            return None
+            
         agent = create_pandas_dataframe_agent(
-            llm=llm,
+            llm=ollama_llm,
             df=df,
             verbose=False,
             allow_dangerous_code=True,
-            max_iterations=50,  # Reasonable number of iterations
+            max_iterations=100,  # Limited iterations for speed
             agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-            handle_parsing_errors="You must use the python_repl_ast tool to execute code. Format: Action: python_repl_ast\nAction Input: [your pandas code]",
-            return_intermediate_steps=True,
         )
-        
-        st.success("✅ Agent ready for analysis!")
         return agent
-        
     except Exception as e:
-        # Fallback to simplest configuration
-        try:
-            st.write("🔧 Using simplified agent configuration...")
-            agent = create_pandas_dataframe_agent(
-                llm=llm,
-                df=df,
-                verbose=False,
-                allow_dangerous_code=True,
-                max_iterations=25,
-                agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-            )
-            st.success("✅ Basic agent created!")
-            return agent
-        except Exception as e2:
-            st.error(f"❌ Agent creation failed: {str(e2)}")
-            return None
+        st.warning(f"Ollama agent creation failed: {str(e)}")
+        return None
 
-def execute_agent_with_fallback(agent, query, df, max_retries=1):
-    """Execute agent with single focused attempt and quick fallback"""
-    
+def create_gemini_agent(df):
+    """Create powerful Gemini agent for complex queries"""
     try:
-        st.write("🔍 Processing with AI agent...")
-        
-        # Single focused attempt with the preprocessed query
-        response = agent.invoke({"input": query})
-        
-        # Extract and analyze the response
-        if isinstance(response, dict):
-            result = response.get("output", str(response))
+        _, gemini_llm = initialize_llms()
+        if not gemini_llm:
+            return None
             
-            # Check intermediate steps for useful content
-            if "intermediate_steps" in response and (not result or "not a valid tool" in result):
-                steps = response.get("intermediate_steps", [])
-                for step in steps:
-                    if len(step) > 1:
-                        step_output = str(step[1])
-                        if len(step_output) > 20 and "not a valid tool" not in step_output:
-                            result = step_output
-                            break
-        else:
-            result = str(response)
-        
-        # Check if we got a meaningful result
-        if result and len(result.strip()) > 15:
-            # Check for tool format errors
-            if "not a valid tool" in result.lower() or "try one of [python_repl_ast]" in result.lower():
-                st.write("🔄 LLM needs guidance on tool format, switching to direct analysis...")
-                return None  # Trigger fallback
-            
-            # Check for other issues
-            elif any(error in result.lower() for error in ["error", "failed", "could not"]):
-                st.write("🔄 Agent encountered technical issues, using reliable analysis...")
-                return None  # Trigger fallback
-            
-            # We have a potentially good result
-            else:
-                st.success("✅ AI analysis complete!")
-                return result
-        
-        # If we reach here, no meaningful result was obtained
-        st.write("🔄 Agent response incomplete, using direct analysis...")
-        return None
-        
+        agent = create_pandas_dataframe_agent(
+            llm=gemini_llm,
+            df=df,
+            verbose=False,
+            allow_dangerous_code=True,
+            handle_parsing_errors=True,
+            max_iterations=100,  # More iterations for complex analysis
+            agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+        )
+        return agent
     except Exception as e:
-        st.write(f"🔄 Agent processing needs adjustment, using reliable fallback...")
+        st.warning(f"Gemini agent creation failed: {str(e)}")
         return None
+
+def preprocess_query_for_llm(query, df, llm_type):
+    """Preprocess query based on LLM type"""
+    if llm_type == "OLLAMA":
+        # Simple, direct instructions for Ollama
+        return f"""Answer this question about the dataframe: {query}
+
+Dataframe info:
+- Columns: {list(df.columns)}
+- Shape: {df.shape}
+
+Use python_repl_ast tool to execute pandas code."""
+    
+    elif llm_type == "GEMINI":
+        # Detailed context and instructions for Gemini
+        return f"""You are a data analysis expert. Analyze this dataframe and answer the question comprehensively.
+
+Dataset Information:
+- Columns: {list(df.columns)}
+- Shape: {df.shape[0]} rows × {df.shape[1]} columns
+- Data types: {dict(df.dtypes)}
+
+Sample data:
+{df.head(2).to_string()}
+
+Question: {query}
+
+Please provide:
+1. Direct answer to the question
+2. Key insights from the analysis
+3. Any notable patterns or recommendations
+
+Use the python_repl_ast tool to execute pandas operations."""
+    
+    return query
+
+def execute_hybrid_agent_strategy(query, df):
+    """Execute hybrid strategy based on query complexity"""
+    
+    # Classify query complexity
+    complexity = classify_query_complexity(query)
+    st.info(f"🎯 Query classified as: **{complexity}**")
+    
+    if complexity == "BASIC":
+        return execute_basic_strategy(query, df)
+    elif complexity == "MODERATE": 
+        return execute_moderate_strategy(query, df)
+    else:  # COMPLEX
+        return execute_complex_strategy(query, df)
+
+def execute_basic_strategy(query, df):
+    """Handle basic queries with Ollama or direct analysis"""
+    st.info("⚡ Using fast local analysis for basic query...")
+    
+    # Try direct analysis first for very basic queries
+    direct_result = try_direct_analysis(query, df)
+    if direct_result:
+        return f"🦙 **Ollama Local Analysis:**\n\n{direct_result}"
+    
+    # Try Ollama agent
+    ollama_agent = create_ollama_agent(df)
+    if ollama_agent:
+        try:
+            processed_query = preprocess_query_for_llm(query, df, "OLLAMA")
+            result = ollama_agent.invoke(processed_query)
+            
+            output = result.get("output", str(result)) if isinstance(result, dict) else str(result)
+            if output and len(output.strip()) > 10:
+                return f"🦙 **Ollama Analysis:**\n\n{output}"
+        except Exception:
+            st.warning("⚠️ Ollama couldn’t handle this query, switching to fallback...")
+    
+    # Fallback to enhanced direct analysis
+    return enhanced_fallback_analysis(df, query)
+
+
+def execute_moderate_strategy(query, df):
+    """Handle moderate queries - try Ollama first, then Gemini"""
+    st.info("🔄 Using hybrid approach for moderate complexity query...")
+    
+    # Try Ollama first (faster)
+    ollama_agent = create_ollama_agent(df)
+    if ollama_agent:
+        try:
+            processed_query = preprocess_query_for_llm(query, df, "OLLAMA")
+            result = ollama_agent.invoke(processed_query)
+            
+            output = result.get("output", str(result)) if isinstance(result, dict) else str(result)
+            if output and len(output.strip()) > 20 and "error" not in output.lower():
+                return f"🦙 **Ollama Analysis:**\n\n{output}"
+        except Exception:
+            st.info("Switching directly to Gemini....")
+    
+    # Fallback to Gemini for better analysis
+    return execute_complex_strategy(query, df)
+
+def execute_complex_strategy(query, df):
+    """Handle complex queries with Gemini"""
+    st.info("💎 Using advanced Gemini analysis for complex query...")
+    
+    gemini_agent = create_gemini_agent(df)
+    if gemini_agent:
+        try:
+            processed_query = preprocess_query_for_llm(query, df, "GEMINI")
+            
+            with st.spinner("🧠 Gemini is performing advanced analysis..."):
+                result = gemini_agent.invoke(processed_query)
+            
+            output = result.get("output", str(result)) if isinstance(result, dict) else str(result)
+            if output and len(output.strip()) > 10:
+                return f"💎 **Gemini Advanced Analysis:**\n\n{output}"
+                
+        except Exception as e:
+            st.warning(f"Gemini analysis failed: {str(e)}")
+    
+    # Final fallback to enhanced analysis
+    st.info("🔧 Using enhanced fallback analysis...")
+    return enhanced_fallback_analysis(df, query)
+
+def try_direct_analysis(query, df):
+    """Quick direct analysis for very basic queries"""
+    query_lower = query.lower()
+    
+    # Very basic operations that don't need LLM
+    if "head" in query_lower or "first" in query_lower:
+        n = extract_number_from_query(query) or 5
+        return f"First {n} rows:\n\n{df.head(n).to_string(index=False)}"
+    
+    elif "shape" in query_lower or "size" in query_lower:
+        return f"Dataset shape: {df.shape[0]} rows × {df.shape[1]} columns"
+    
+    elif "columns" in query_lower:
+        return f"Columns: {', '.join(df.columns)}\n\nColumn details:\n" + "\n".join([f"• {col} ({df[col].dtype})" for col in df.columns])
+    
+    elif "describe" in query_lower and len(query.split()) <= 3:
+        return f"Dataset description:\n\n{df.describe().to_string()}"
+    
+    elif "unique" in query_lower:
+        return f"Unique values per column:\n\n{df.nunique().to_string()}"
+    
+    elif "value counts" in query_lower:
+        # Try to detect column name from query, fallback to first column
+        detected_col = None
+        for col in df.columns:
+            if col.lower() in query_lower:
+                detected_col = col
+                break
+        col = detected_col or df.columns[0]
+        return f"Value counts for '{col}':\n\n{df[col].value_counts().to_string()}"
+    
+    return None
 
 def enhanced_fallback_analysis(df, query):
-    """Enhanced fallback that works with any kind of data structure"""
+    """Enhanced fallback analysis for when agents fail"""
     try:
         query_lower = query.lower()
         
-        # Dynamically detect column names and types
+        # Dynamic column detection
         numeric_columns = df.select_dtypes(include=['number']).columns.tolist()
         text_columns = df.select_dtypes(include=['object']).columns.tolist()
-        date_columns = []
+        date_columns = detect_date_columns(df)
         
-        # Try to detect date columns
-        for col in df.columns:
-            try:
-                pd.to_datetime(df[col].head(), errors='raise')
-                date_columns.append(col)
-            except:
-                continue
-        
-        # Handle visualization requests
+        # Handle different query types
         if any(viz_word in query_lower for viz_word in ["plot", "graph", "chart", "visualize"]):
-            return handle_visualization_request(df, query, numeric_columns, text_columns)
+            return handle_visualization_analysis(df, query, numeric_columns, text_columns)
         
-        # Handle analysis requests
         elif any(analysis_word in query_lower for analysis_word in ["analyze", "analysis", "insights", "trends"]):
-            return handle_analysis_request(df, query, numeric_columns, text_columns, date_columns)
+            return handle_comprehensive_analysis(df, query, numeric_columns, text_columns, date_columns)
         
-        # Handle summary requests
-        elif any(summary_word in query_lower for summary_word in ["summary", "summarize", "overview"]):
-            return handle_summary_request(df, numeric_columns, text_columns, date_columns)
+        elif any(date_word in query_lower for date_word in ["on", "date", "day"]) and date_columns:
+            return handle_date_specific_analysis(df, query, query_lower, date_columns, numeric_columns)
         
-        # Handle date-specific queries (works with any date column)
-        elif any(date_word in query_lower for date_word in ["on", "date", "day", "2023", "2024"]) and date_columns:
-            return handle_dynamic_date_query(df, query, query_lower, date_columns, numeric_columns)
+        elif any(agg_word in query_lower for agg_word in ["total", "sum", "average", "mean"]) and numeric_columns:
+            return handle_aggregation_analysis(df, query, query_lower, numeric_columns)
         
-        # Handle aggregation queries (works with any numeric column)
-        elif any(agg_word in query_lower for agg_word in ["total", "sum", "average", "mean", "max", "min"]) and numeric_columns:
-            return handle_dynamic_aggregation_query(df, query, query_lower, numeric_columns)
-        
-        # Handle basic data exploration
-        elif any(word in query_lower for word in ["head", "first", "top"]):
-            n = extract_number_from_query(query) or 5
-            return f"First {n} rows of data:\n\n{df.head(n).to_string(index=False)}"
-        
-        elif "shape" in query_lower or "size" in query_lower:
-            return f"Dataset shape: {df.shape[0]} rows and {df.shape[1]} columns"
-        
-        elif "columns" in query_lower:
-            col_info = []
-            for col in df.columns:
-                col_type = str(df[col].dtype)
-                unique_count = df[col].nunique()
-                col_info.append(f"{col} ({col_type}, {unique_count} unique values)")
-            return f"Dataset columns:\n" + "\n".join([f"• {info}" for info in col_info])
-        
-        elif "describe" in query_lower:
-            description = f"Dataset Overview:\n\n"
-            description += f"Shape: {df.shape[0]} rows × {df.shape[1]} columns\n\n"
-            
-            if numeric_columns:
-                description += f"Numeric columns summary:\n{df[numeric_columns].describe().to_string()}\n\n"
-            
-            if text_columns:
-                description += f"Text columns info:\n"
-                for col in text_columns:
-                    description += f"• {col}: {df[col].nunique()} unique values\n"
-            
-            return description
-        
-        # Generic column-based search
         else:
-            return handle_generic_query(df, query, numeric_columns, text_columns, date_columns)
+            return generate_helpful_response(df, query)
         
     except Exception as e:
-        return f"Error in analysis: {str(e)}\n\nDataset info:\n- Columns: {', '.join(df.columns)}\n- Shape: {df.shape}"
+        return f"Analysis error: {str(e)}\n\nDataset info: {df.shape[0]} rows, {df.shape[1]} columns"
 
-def handle_visualization_request(df, query, numeric_columns, text_columns):
-    """Handle visualization requests"""
-    viz_suggestion = f"📊 **Visualization Analysis for:** {query}\n\n"
-    
-    if numeric_columns:
-        viz_suggestion += f"**Suggested visualizations:**\n"
-        viz_suggestion += f"• Histogram of {numeric_columns[0]} values\n"
-        viz_suggestion += f"• Box plot to show distribution\n"
-        
-        if len(numeric_columns) > 1:
-            viz_suggestion += f"• Scatter plot between {numeric_columns[0]} and {numeric_columns[1]}\n"
-        
-        if text_columns:
-            viz_suggestion += f"• Bar chart of {numeric_columns[0]} by {text_columns[0]}\n"
-    
-    viz_suggestion += f"\n**Sample data for visualization:**\n{df.head().to_string(index=False)}"
-    
-    return viz_suggestion
+def detect_date_columns(df):
+    """Detect potential date columns"""
+    date_columns = []
+    for col in df.columns:
+        try:
+            pd.to_datetime(df[col].head(10), errors='raise')
+            date_columns.append(col)
+        except:
+            continue
+    return date_columns
 
-def handle_analysis_request(df, query, numeric_columns, text_columns, date_columns):
-    """Handle analysis requests"""
-    analysis = f"📈 **Data Analysis for:** {query}\n\n"
+def handle_visualization_analysis(df, query, numeric_cols, text_cols):
+    """Provide visualization insights"""
+    return f"""📊 **Visualization Analysis for:** {query}
+
+**Recommended Charts:**
+{f"• Histogram: {numeric_cols[0]} distribution" if numeric_cols else ""}
+{f"• Bar Chart: {text_cols[0]} categories" if text_cols else ""}
+{f"• Scatter Plot: {numeric_cols[0]} vs {numeric_cols[1]}" if len(numeric_cols) > 1 else ""}
+
+**Data Summary:**
+{df.describe().to_string() if numeric_cols else "No numeric data for statistics"}
+"""
+
+def handle_comprehensive_analysis(df, query, numeric_cols, text_cols, date_cols):
+    """Provide comprehensive data analysis"""
+    analysis = f"📈 **Comprehensive Analysis for:** {query}\n\n"
     
-    # Basic statistics
-    if numeric_columns:
-        analysis += f"**Numeric Analysis:**\n"
-        for col in numeric_columns:
-            analysis += f"• {col}: Mean={df[col].mean():.2f}, Std={df[col].std():.2f}, Range={df[col].min()}-{df[col].max()}\n"
+    # Statistical summary
+    if numeric_cols:
+        analysis += "**📊 Statistical Summary:**\n"
+        for col in numeric_cols:
+            stats = df[col].agg(['mean', 'std', 'min', 'max'])
+            analysis += f"• {col}: Mean={stats['mean']:.2f}, Std={stats['std']:.2f}, Range=[{stats['min']}-{stats['max']}]\n"
     
     # Categorical analysis
-    if text_columns:
-        analysis += f"\n**Categorical Analysis:**\n"
-        for col in text_columns:
-            top_values = df[col].value_counts().head(3)
-            analysis += f"• {col}: {df[col].nunique()} categories, Top: {', '.join([f'{k}({v})' for k,v in top_values.items()])}\n"
+    if text_cols:
+        analysis += "\n**📋 Categorical Analysis:**\n"
+        for col in text_cols:
+            top_3 = df[col].value_counts().head(3)
+            analysis += f"• {col}: {df[col].nunique()} unique values, Top 3: {dict(top_3)}\n"
     
-    # Time-based analysis if date columns exist
-    if date_columns:
-        analysis += f"\n**Time-based Analysis:**\n"
-        for col in date_columns:
-            date_range = f"{df[col].min()} to {df[col].max()}"
-            analysis += f"• {col}: Date range {date_range}\n"
+    # Correlation analysis
+    if len(numeric_cols) > 1:
+        corr_matrix = df[numeric_cols].corr()
+        analysis += f"\n**🔗 Correlations:**\n{corr_matrix.to_string()}\n"
     
     return analysis
 
-def handle_summary_request(df, numeric_columns, text_columns, date_columns):
-    """Handle summary requests"""
-    summary = f"📋 **Data Summary**\n\n"
-    summary += f"**Dataset Overview:**\n"
-    summary += f"• Total records: {df.shape[0]:,}\n"
-    summary += f"• Total columns: {df.shape[1]}\n"
-    summary += f"• Missing values: {df.isnull().sum().sum()}\n\n"
-    
-    summary += f"**Column Breakdown:**\n"
-    summary += f"• Numeric columns ({len(numeric_columns)}): {', '.join(numeric_columns) if numeric_columns else 'None'}\n"
-    summary += f"• Text columns ({len(text_columns)}): {', '.join(text_columns) if text_columns else 'None'}\n"
-    summary += f"• Date columns ({len(date_columns)}): {', '.join(date_columns) if date_columns else 'None'}\n\n"
-    
-    if numeric_columns:
-        summary += f"**Key Statistics:**\n{df[numeric_columns].describe().to_string()}\n"
-    
-    return summary
-
-def handle_dynamic_date_query(df, query, query_lower, date_columns, numeric_columns):
-    """Handle date queries with any date column"""
-    import re
-    
-    # Extract date from query
+def handle_date_specific_analysis(df, query, query_lower, date_cols, numeric_cols):
+    """Handle date-specific queries"""
     dates = re.findall(r'\d{4}-\d{2}-\d{2}', query)
     if not dates:
-        return "Could not extract a valid date. Please use format like '2023-01-02'"
+        return "Could not extract valid date. Use format like '2023-01-02'"
     
-    found_date = dates[0]
-    
-    # Use the first date column found
-    date_col = date_columns[0]
+    date_col = date_cols[0]
+    target_date = dates[0]
     
     try:
-        # Convert and filter
         df_copy = df.copy()
         df_copy[date_col] = pd.to_datetime(df_copy[date_col]).dt.strftime('%Y-%m-%d')
-        filtered_df = df_copy[df_copy[date_col] == found_date]
+        filtered_df = df_copy[df_copy[date_col] == target_date]
         
         if filtered_df.empty:
-            return f"No data found for {found_date} in {date_col} column.\nAvailable dates: {', '.join(df_copy[date_col].unique()[:5])}"
+            return f"No data found for {target_date}"
         
-        result = f"📅 **Data for {found_date}:**\n\n"
+        result = f"📅 **Analysis for {target_date}:**\n\n"
         
-        if "total" in query_lower and numeric_columns:
-            for col in numeric_columns:
+        if "total" in query_lower and numeric_cols:
+            for col in numeric_cols:
                 total = filtered_df[col].sum()
-                result += f"• Total {col}: {total}\n"
-        elif "average" in query_lower and numeric_columns:
-            for col in numeric_columns:
-                avg = filtered_df[col].mean()
-                result += f"• Average {col}: {avg:.2f}\n"
+                result += f"• Total {col}: {total:,}\n"
         
-        result += f"\n**Detailed records:**\n{filtered_df.to_string(index=False)}"
+        result += f"\n**Records ({len(filtered_df)}):**\n{filtered_df.to_string(index=False)}"
         return result
         
     except Exception as e:
-        return f"Error processing date query: {str(e)}"
+        return f"Date analysis error: {str(e)}"
 
-def handle_dynamic_aggregation_query(df, query, query_lower, numeric_columns):
-    """Handle aggregation queries with any numeric column"""
-    result = f"📊 **Aggregation Analysis:**\n\n"
+def handle_aggregation_analysis(df, query, query_lower, numeric_cols):
+    """Handle aggregation queries"""
+    result = "📊 **Aggregation Analysis:**\n\n"
     
-    if "total" in query_lower or "sum" in query_lower:
-        for col in numeric_columns:
-            total = df[col].sum()
-            result += f"• Total {col}: {total:,}\n"
-    
-    if "average" in query_lower or "mean" in query_lower:
-        for col in numeric_columns:
-            avg = df[col].mean()
-            result += f"• Average {col}: {avg:.2f}\n"
-    
-    if "max" in query_lower:
-        for col in numeric_columns:
-            maximum = df[col].max()
-            result += f"• Maximum {col}: {maximum}\n"
-    
-    if "min" in query_lower:
-        for col in numeric_columns:
-            minimum = df[col].min()
-            result += f"• Minimum {col}: {minimum}\n"
+    for col in numeric_cols:
+        if "total" in query_lower or "sum" in query_lower:
+            result += f"• Total {col}: {df[col].sum():,}\n"
+        if "average" in query_lower or "mean" in query_lower:
+            result += f"• Average {col}: {df[col].mean():.2f}\n"
+        if "max" in query_lower:
+            result += f"• Maximum {col}: {df[col].max():,}\n"
+        if "min" in query_lower:
+            result += f"• Minimum {col}: {df[col].min():,}\n"
     
     return result
 
-def handle_generic_query(df, query, numeric_columns, text_columns, date_columns):
-    """Handle any other query by providing helpful information"""
-    return f"""🤔 **Analysis for:** "{query}"
+def generate_helpful_response(df, query):
+    """Generate helpful response for unmatched queries"""
+    numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+    text_cols = df.select_dtypes(include=['object']).columns.tolist()
+    
+    return f"""🤔 **Query:** "{query}"
 
-I can help you analyze this dataset. Here's what's available:
+**💡 What I can help with:**
 
-**📊 Dataset Structure:**
-• {df.shape[0]:,} rows × {df.shape[1]} columns
-• Numeric columns: {', '.join(numeric_columns) if numeric_columns else 'None'}
-• Text columns: {', '.join(text_columns) if text_columns else 'None'}
-• Date columns: {', '.join(date_columns) if date_columns else 'None'}
+**Basic Queries (⚡ Fast Local):**
+- "Show first 5 rows" 
+- "Describe the data"
+- "What columns are available?"
 
-**💡 Try asking:**
-• "Analyze the data" or "Show me insights"
-• "Total [numeric column]" or "Average [numeric column]"
-• "Show data for [specific date]" (if date columns exist)
-• "Create a summary" or "Describe the data"
-• "Plot/graph [column name]"
+**Moderate Queries (🔄 Hybrid):**
+- "Total sales" / "Average sales"
+- "Data for specific date"
+- "Filter and summarize"
 
-**🔍 Sample data:**
+**Complex Queries (💎 Advanced AI):**
+- "Analyze trends and patterns"
+- "Provide insights and recommendations" 
+- "Compare and correlate data"
+
+**📊 Your Dataset:**
+- {df.shape[0]} rows × {df.shape[1]} columns
+- Numeric: {numeric_cols}
+- Text: {text_cols}
+
+**Sample:** 
 {df.head(2).to_string(index=False)}
 """
 
-def handle_date_query(df, query, query_lower):
-    """Handle date-specific queries with better parsing"""
-    if 'Date' not in df.columns:
-        return "No 'Date' column found in the dataset."
-    
-    # Extract date from query
-    date_patterns = [
-        r'\d{4}-\d{2}-\d{2}',  # YYYY-MM-DD
-        r'\d{4}/\d{2}/\d{2}',  # YYYY/MM/DD
-        r'\d{2}-\d{2}-\d{4}',  # DD-MM-YYYY
-        r'\d{2}/\d{2}/\d{4}'   # DD/MM/YYYY
-    ]
-    
-    found_date = None
-    for pattern in date_patterns:
-        match = re.search(pattern, query)
-        if match:
-            found_date = match.group()
-            break
-    
-    if not found_date:
-        return "Could not extract a valid date from your query. Please use format like '2023-01-02'"
-    
-    try:
-        # Convert date column to string for comparison
-        df_copy = df.copy()
-        df_copy['Date'] = pd.to_datetime(df_copy['Date']).dt.strftime('%Y-%m-%d')
-        
-        # Normalize the found date to YYYY-MM-DD format
-        if '/' in found_date:
-            found_date = found_date.replace('/', '-')
-        
-        # Filter for the specific date
-        filtered_df = df_copy[df_copy['Date'] == found_date]
-        
-        if filtered_df.empty:
-            return f"No data found for date: {found_date}\n\nAvailable dates: {', '.join(df_copy['Date'].unique())}"
-        
-        # Determine what analysis to perform
-        if "total sales" in query_lower or "sum" in query_lower:
-            if 'Sales' in filtered_df.columns:
-                total = filtered_df['Sales'].sum()
-                return f"Total sales on {found_date}: {total}\n\nDetailed records:\n{filtered_df.to_string(index=False)}"
-        elif "average sales" in query_lower or "mean" in query_lower:
-            if 'Sales' in filtered_df.columns:
-                avg = filtered_df['Sales'].mean()
-                return f"Average sales on {found_date}: {avg:.2f}\n\nDetailed records:\n{filtered_df.to_string(index=False)}"
-        else:
-            return f"Data for {found_date}:\n{filtered_df.to_string(index=False)}"
-            
-    except Exception as e:
-        return f"Error processing date query: {str(e)}"
-
-def handle_product_query(df, query, query_lower):
-    """Handle product-related queries"""
-    if 'Product' not in df.columns:
-        return "No 'Product' column found in the dataset."
-    
-    # Check for specific sales value
-    numbers = re.findall(r'\d+', query)
-    if numbers and 'Sales' in df.columns:
-        value = int(numbers[0])
-        result = df[df['Sales'] == value]
-        if not result.empty:
-            products = result['Product'].tolist()
-            return f"Product(s) with sales = {value}: {', '.join(map(str, products))}\n\nFull records:\n{result.to_string(index=False)}"
-        else:
-            return f"No products found with sales = {value}"
-    else:
-        # Show all products and sales
-        if 'Sales' in df.columns:
-            return f"All products and their sales:\n{df[['Product', 'Sales']].to_string(index=False)}"
-        else:
-            return f"All products:\n{df['Product'].tolist()}"
-
-def handle_region_query(df, query_lower):
-    """Handle region-related queries"""
-    if 'Region' not in df.columns:
-        return "No 'Region' column found in the dataset."
-    
-    return f"Unique regions: {', '.join(df['Region'].unique())}\n\nRegion distribution:\n{df['Region'].value_counts().to_string()}"
-
 def extract_number_from_query(query):
-    """Extract number from query string"""
+    """Extract number from query"""
     numbers = re.findall(r'\d+', query)
     return int(numbers[0]) if numbers else None
 
-def execute_safe_pandas(df, query_lower):
-    """Execute safe pandas operations"""
-    safe_operations = ['head', 'tail', 'describe', 'info', 'shape', 'columns', 'dtypes', 'mean', 'sum', 'count', 'max', 'min']
-    if any(op in query_lower for op in safe_operations):
-        try:
-            result = eval(query_lower)
-            return f"Result:\n{str(result)}"
-        except Exception as e:
-            return f"Error executing pandas code: {str(e)}"
-    else:
-        return "For security reasons, only basic pandas operations are allowed in direct execution."
-
-def generate_helpful_default_response(df, query):
-    """Generate a helpful default response when query doesn't match patterns"""
-    return f"""I couldn't understand your specific query: "{query}"
-
-Here's what I can help you with:
-
-**Basic Data Operations:**
-- "show first 5 rows" or "head of data"
-- "describe data" or "data summary"
-- "show columns" or "data shape"
-
-**Sales Analysis:**
-- "total sales" or "sum of sales"
-- "average sales" or "mean sales"
-
-**Date-Specific Queries:**
-- "total sales on 2023-01-02"
-- "show data for 2023-01-01"
-
-**Product Analysis:**
-- "product with sales 100"
-- "show all products and sales"
-
-**Current dataset overview:**
-- Shape: {df.shape[0]} rows, {df.shape[1]} columns
-- Columns: {', '.join(df.columns.tolist())}
-
-Sample data:
-{df.head(2).to_string()}"""
-
-# Main agent execution function
 def run_agent(query):
-    """Main function to run the agent with improved error handling"""
+    """Main function with hybrid LLM strategy"""
     
-    # Check if the sales data file exists
+    # Check data file
     if not os.path.exists("data/sales_data.csv"):
-        st.error("sales_data.csv not found in /data folder!")
-        return "Error: Data file not found. Please ensure 'sales_data.csv' exists in the 'data' folder."
+        st.error("❌ sales_data.csv not found in /data folder!")
+        return "Error: Data file not found."
             
-    # Load the sales data
+    # Load data
     try:
         df = pd.read_csv("data/sales_data.csv")
-        st.info(f"✅ Loaded data successfully: {df.shape[0]} rows, {df.shape[1]} columns")
+        st.success(f"✅ Data loaded: {df.shape[0]} rows × {df.shape[1]} columns")
         
-        # Show data preview
         with st.expander("📊 Data Preview"):
-            st.write("**Columns:**", list(df.columns))
-            st.write("**First few rows:**")
-            st.dataframe(df.head())
-            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write("**Columns & Types:**")
+                for col in df.columns:
+                    st.write(f"• {col} ({df[col].dtype})")
+            with col2:
+                st.write("**Sample Data:**")
+                st.dataframe(df.head())
+                
     except Exception as e:
         st.error(f"❌ Error loading data: {str(e)}")
-        return "Error loading data. Please check your CSV file format."
+        return "Error loading data."
         
-    # Determine query type
-    sales_keywords = ["sales", "revenue", "profit", "data", "df", "dataframe", "analyze", "total", "average", "sum", "mean"]
+    # Route query
+    sales_keywords = ["sales", "data", "df", "total", "average", "analyze", "show", "product", "region"]
     is_sales_query = any(keyword in query.lower() for keyword in sales_keywords)
         
-    # Load the ChromaDB knowledge base
-    vector_store = None
-    if os.path.exists("./chroma_db"):
-        try:
-            embeddings = HuggingFaceEmbeddings()
-            vector_store = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
-            st.info("📚 Knowledge base loaded")
-        except Exception as e:
-            st.warning(f"⚠️ Error loading knowledge base: {str(e)}")
-            
     if is_sales_query:
-        st.info("🔍 Routing to sales data analysis...")
-        
-        # Enable agent for intelligent analysis with Ollama LLM
-        query_lower = query.lower()
-        
-        # Use agent for most queries, with smart fallback for when it fails
-        use_agent = True  # Enable agent to use Ollama LLM
-        
-        if use_agent:
-            st.info("🤖 Using Ollama LLaMA 2 agent for intelligent analysis...")
-            
-            # Create and execute agent
-            pandas_agent = create_robust_agent_with_retries(df)
-            
-            if pandas_agent:
-                processed_query = preprocess_query_for_agent(query, df)
-                agent_result = execute_agent_with_fallback(pandas_agent, processed_query, df)
-                
-                if agent_result:
-                    return agent_result
-            
-            # If agent fails, use enhanced fallback as backup
-            st.info("🔄 Agent encountered issues, using enhanced fallback analysis...")
-            
-        else:
-            st.info("⚡ Using direct analysis...")
-            
-        return enhanced_fallback_analysis(df, query)
-        
+        st.info("🔍 Routing to hybrid LLM analysis...")
+        return execute_hybrid_agent_strategy(query, df)
     else:
-        st.info("🔍 Routing to knowledge base search...")
-        if vector_store:
+        # Knowledge base search
+        st.info("📚 Searching knowledge base...")
+        if os.path.exists("./chroma_db"):
             try:
+                embeddings = HuggingFaceEmbeddings()
+                vector_store = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
                 docs = vector_store.similarity_search(query, k=3)
                 if docs:
-                    response = "📖 **Based on the knowledge base:**\n\n"
-                    for i, doc in enumerate(docs, 1):
-                        response += f"**{i}.** {doc.page_content}\n\n"
-                    return response
+                    return "📖 **Knowledge Base Results:**\n\n" + "\n\n".join([f"**{i+1}.** {doc.page_content}" for i, doc in enumerate(docs)])
                 else:
-                    return "❓ I couldn't find any relevant information in the knowledge base for your query."
+                    return "❓ No relevant information found in knowledge base."
             except Exception as e:
-                return f"❌ Error searching knowledge base: {str(e)}"
+                return f"❌ Knowledge base error: {str(e)}"
         else:
-            return "📝 No knowledge base available. Please upload a document in the Knowledge Base page to create one."
+            return "📝 No knowledge base available."
 
 # Streamlit UI
-st.set_page_config(page_title="AI Agents", page_icon="🤖", layout="wide")
+st.set_page_config(page_title="Hybrid AI Agents", page_icon="🤖", layout="wide")
 
-st.title("🤖 AI Data Analysis Agents")
-st.markdown("*Interact with intelligent AI agents to get insights from your data and knowledge base.*")
+st.title("🤖 Hybrid AI Data Analysis Agents")
+st.markdown("*Intelligent routing: Ollama for speed 🦙 • Gemini for complexity 💎*")
 
-# Add example queries in a more organized way
-with st.expander("💡 Example Queries"):
-    col1, col2 = st.columns(2)
+# Initialize LLMs and show status
+ollama_llm, gemini_llm = initialize_llms()
+
+# Display LLM status
+col1, col2 = st.columns(2)
+with col1:
+    if ollama_llm:
+        st.success("🦙 **Ollama Ready** - Fast Local Analysis")
+    else:
+        st.error("❌ **Ollama Unavailable**")
+        
+with col2:
+    if gemini_llm:
+        st.success("💎 **Gemini Ready** - Advanced AI Analysis") 
+    else:
+        st.warning("⚠️ **Gemini Unavailable** - Set API key")
+
+# Strategy explanation
+with st.expander("🎯 How Hybrid Strategy Works"):
+    st.markdown("""
+    **🚀 Query Classification:**
+    - **BASIC** → 🦙 Ollama (Fast, Local): Simple data operations
+    - **MODERATE** → 🔄 Hybrid: Try Ollama first, fallback to Gemini  
+    - **COMPLEX** → 💎 Gemini (Advanced): Deep analysis, insights, trends
+    
+    **✅ Benefits:**
+    - ⚡ Faster responses for simple queries
+    - 🧠 Advanced AI for complex analysis  
+    - 💰 Cost optimization (less API usage)
+    - 🔄 Reliable fallbacks
+    """)
+
+# Example queries
+with st.expander("💡 Example Queries by Complexity"):
+    col1, col2, col3 = st.columns(3)
     
     with col1:
         st.markdown("""
-        **📊 Sales Data Analysis:**
-        - `Show me the first 5 rows of data`
-        - `What is the total sales?`
-        - `What is the average sales?`
-        - `Total sales on 2023-01-02`
-        - `Product with sales 100`
-        - `Show all regions`
+        **🦙 BASIC (Ollama)**
+        - `Show first 5 rows`
+        - `What columns exist?`
+        - `Describe the data`
+        - `Dataset shape`
         """)
     
     with col2:
         st.markdown("""
-        **🔍 Data Exploration:**
-        - `Describe the data`
-        - `Show data summary` 
-        - `What columns do we have?`
-        - `Show sales data for date 2023-01-01`
-        - `Find products and their sales`
-        - `Any questions about uploaded documents`
+        **🔄 MODERATE (Hybrid)**
+        - `Total sales`
+        - `Average by region`
+        - `Sales on 2023-01-02`
+        - `Product with sales 100`
+        """)
+    
+    with col3:
+        st.markdown("""
+        **💎 COMPLEX (Gemini)**
+        - `Analyze sales trends`
+        - `Find patterns and insights`
+        - `Recommendations for optimization`
+        - `Correlations and predictions`
         """)
 
-# Main input
+# Main query input
 query = st.text_input(
-    "🗣️ **Ask the AI agent a question:**", 
-    placeholder="e.g., 'What is the total sales on 2023-01-02?' or 'Show me the product data'",
-    help="Type your question about the data or knowledge base"
+    "🗣️ **Ask your question:**",
+    placeholder="e.g., 'Analyze sales trends' or 'Show first 5 rows'",
+    help="System will automatically choose the best AI for your query"
 )
 
-# Execute query
+# Process query
 if query:
-    with st.spinner("🧠 AI agent is analyzing your request..."):
+    with st.spinner("🧠 Processing with hybrid AI strategy..."):
         try:
             response = run_agent(query)
             
-            # Display response with better formatting
             st.markdown("---")
-            st.markdown("### 📝 Response:")
+            st.markdown("### 📝 Analysis Results:")
             
-            if isinstance(response, str) and len(response) > 800:
-                st.text_area("Detailed Response:", response, height=300)
+            if len(response) > 1000:
+                st.text_area("Detailed Response:", response, height=400)
             else:
                 st.markdown(response)
                 
         except Exception as e:
-            st.error(f"❌ An unexpected error occurred: {str(e)}")
-            st.info("💡 Try a simpler query or check your data file format.")
+            st.error(f"❌ Error: {str(e)}")
 
-# Enhanced sidebar with system status
+# Enhanced sidebar
 with st.sidebar:
     st.markdown("## 🔧 System Status")
     
-    # Check data file
+    # Data status
     if os.path.exists("data/sales_data.csv"):
-        st.success("✅ Sales data loaded")
+        st.success("✅ **Data File Ready**")
         try:
             df = pd.read_csv("data/sales_data.csv")
-            st.markdown(f"**Rows:** {df.shape[0]}")
-            st.markdown(f"**Columns:** {df.shape[1]}")
-            st.markdown(f"**Columns:** {', '.join(df.columns.tolist())}")
+            st.write(f"📊 **{df.shape[0]}** rows × **{df.shape[1]}** columns")
+            st.caption(f"Columns: {', '.join(df.columns.tolist())}")
         except:
-            st.warning("⚠️ Data file exists but couldn't read it")
+            st.warning("⚠️ Data file issues")
     else:
-        st.error("❌ Sales data not found")
-        st.info("Place your `sales_data.csv` file in the `data/` folder")
+        st.error("❌ **sales_data.csv missing**")
     
-    # Check knowledge base
-    if os.path.exists("./chroma_db"):
-        st.success("✅ Knowledge base available")
-    else:
-        st.info("ℹ️ No knowledge base found")
-        st.caption("Upload documents in Knowledge Base page")
-        
     # LLM status
-    st.success("✅ Ollama LLM configured")
-    st.caption("Model: llama2:latest")
+    st.markdown("### 🤖 AI Models")
+    if ollama_llm:
+        st.success("🦙 Ollama Active")
+    else:
+        st.error("❌ Ollama Offline")
+        
+    if gemini_llm:
+        st.success("💎 Gemini Active")
+    else:
+        st.warning("⚠️ Gemini API Key Needed")
     
-    # Add helpful tips
+    # Knowledge base
+    if os.path.exists("./chroma_db"):
+        st.success("✅ Knowledge Base Ready")
+    else:
+        st.info("ℹ️ No Knowledge Base")
+    
     st.markdown("---")
-    st.markdown("## 💡 Tips")
+    st.markdown("### ⚡ Performance Tips")
     st.markdown("""
-    - Be specific in your queries
-    - Use exact column names when possible
-    - Try different phrasings if one doesn't work
-    - Check data preview for column names
+    - Use specific keywords for better routing
+    - Basic queries are fastest with Ollama
+    - Complex analysis uses advanced Gemini AI
+    - System auto-selects optimal model
     """)

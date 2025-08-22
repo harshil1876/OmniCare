@@ -12,4 +12,6 @@ google-generativeai
 numpy<2
 sentence-transformers
 langchain-ollama
+python-dotenv
 tabulate
+langchain-google-genai
