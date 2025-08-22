@@ -1,5 +1,3 @@
-# app.py — OmniCore Hybrid Agents (updated)
-
 import os
 import re
 import json
