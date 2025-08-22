@@ -1,645 +1,1163 @@
-import streamlit as st
-from langchain_experimental.agents import create_pandas_dataframe_agent
-from langchain_ollama.llms import OllamaLLM
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain.agents import AgentType
-from langchain_community.callbacks.streamlit import StreamlitCallbackHandler
-from langchain.schema import OutputParserException
-from dotenv import load_dotenv
-import pandas as pd
+# app.py — OmniCore Hybrid Agents (updated)
+
 import os
 import re
+import json
+import time
+import pandas as pd
+import streamlit as st
+from datetime import datetime
+from typing import Dict, List, Tuple, Optional
+from dotenv import load_dotenv
 
-# Load environment variables from .env
+from langchain_experimental.agents import create_pandas_dataframe_agent
+from langchain.agents import AgentType
+from langchain.schema import OutputParserException
+
+# LLMs
+from langchain_ollama.llms import OllamaLLM
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+# Vector store (Chroma) + Embeddings
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import HuggingFaceEmbeddings
+
+# ---------- Setup ----------
+st.set_page_config(page_title="OmniCore Hybrid Agents", page_icon="🤖", layout="wide")
 load_dotenv()
 
-# Initialize both LLMs
-@st.cache_resource
+DATA_PATH = "data/sales_data.csv"
+CHROMA_DIR = "./chroma_db"
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+AUDIT_LOG_FILE = "audit_logs.json"
+
+# ---------- Utilities ----------
+
+def safe_extract_output(res) -> str:
+    """
+    Robustly extract agent output regardless of backend return schema.
+    Handles dicts with 'output' or 'text', lists, or raw strings.
+    """
+    if res is None:
+        return ""
+    if isinstance(res, str):
+        return res
+    if isinstance(res, dict):
+        if "output" in res and isinstance(res["output"], str):
+            return res["output"]
+        if "text" in res and isinstance(res["text"], str):
+            return res["text"]
+        # langchain agents often put final text under 'output' or 'output_text'
+        if "output_text" in res and isinstance(res["output_text"], str):
+            return res["output_text"]
+        # Fallback to stringify dict
+        return json.dumps(res, ensure_ascii=False)
+    # Fallback to str
+    return str(res)
+
+def stringify_exception(e: Exception, limit: int = 140) -> str:
+    msg = f"{type(e).__name__}: {str(e)}"
+    return (msg[:limit] + "...") if len(msg) > limit else msg
+
+# ---------- Audit & Tracking ----------
+class QueryTracker:
+    def __init__(self):
+        if 'query_stats' not in st.session_state:
+            st.session_state.query_stats = {
+                'total_queries': 0,
+                'heuristic_hits': 0,
+                'ollama_calls': 0,
+                'gemini_calls': 0,
+                'fallback_hits': 0,
+                'pandas_direct': 0,
+                'pandas_agent': 0,
+                'audit_logs': []
+            }
+    
+    def log_query(self, query: str, complexity: str, execution_path: str, success: bool, response_time: float):
+        log_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'query': query,
+            'complexity': complexity,
+            'execution_path': execution_path,
+            'success': success,
+            'response_time_ms': response_time * 1000,
+        }
+        
+        st.session_state.query_stats['total_queries'] += 1
+        st.session_state.query_stats['audit_logs'].append(log_entry)
+        
+        # Update path counters
+        if execution_path == 'heuristic':
+            st.session_state.query_stats['heuristic_hits'] += 1
+        elif execution_path == 'ollama':
+            st.session_state.query_stats['ollama_calls'] += 1
+        elif execution_path == 'gemini':
+            st.session_state.query_stats['gemini_calls'] += 1
+        elif execution_path == 'fallback':
+            st.session_state.query_stats['fallback_hits'] += 1
+        elif execution_path == 'pandas_direct':
+            st.session_state.query_stats['pandas_direct'] += 1
+        elif execution_path == 'pandas-agent':
+            st.session_state.query_stats['pandas_agent'] += 1
+            
+        # Persist to file (optional, best-effort)
+        try:
+            with open(AUDIT_LOG_FILE, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+        except Exception:
+            pass  # Silent fail for audit logging
+    
+    def get_stats(self) -> Dict:
+        return st.session_state.query_stats
+
+# Global tracker
+tracker = QueryTracker()
+
+# ---------- Schema Detection & Management ----------
+class SchemaManager:
+    def __init__(self):
+        if 'detected_schema' not in st.session_state:
+            st.session_state.detected_schema = None
+    
+    def detect_schema_with_llm(self, df: pd.DataFrame, ollama_llm, gemini_llm) -> Dict:
+        """Use LLM to intelligently detect and categorize DataFrame schema"""
+        
+        # Prefer Gemini for schema reasoning, fallback to Ollama, else rule-based
+        llm = gemini_llm if gemini_llm else ollama_llm
+        if not llm:
+            return self._fallback_schema_detection(df)
+        
+        # Create schema detection prompt
+        sample_data = df.head(3).to_string(index=False, max_cols=10)
+        dtypes_info = {col: str(dtype) for col, dtype in df.dtypes.items()}
+        
+        schema_prompt = f"""Analyze this DataFrame and provide a JSON schema classification:
+
+DataFrame Info:
+- Shape: {df.shape[0]} rows × {df.shape[1]} columns
+- Column Types: {dtypes_info}
+
+Sample Data:
+{sample_data}
+
+Please return ONLY a valid JSON with this structure:
+{{
+    "numeric_columns": ["list of numeric columns for calculations"],
+    "categorical_columns": ["list of text/categorical columns"],
+    "date_columns": ["list of date/datetime columns"],
+    "id_columns": ["list of ID/identifier columns"],
+    "business_metrics": ["list of business KPI columns like sales, revenue, etc"],
+    "groupby_candidates": ["list of columns good for grouping/segmentation"],
+    "primary_business_entities": ["main entities like product, customer, region"],
+    "schema_insights": "Brief description of what this dataset represents"
+}}"""
+        try:
+            response = llm.invoke(schema_prompt)
+            response_text = safe_extract_output(response)
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                schema = json.loads(json_match.group())
+                st.session_state.detected_schema = schema
+                return schema
+        except Exception as e:
+            st.info(f"LLM schema detection failed: {stringify_exception(e)} -> Using fallback")
+        
+        # Fallback to rule-based detection
+        return self._fallback_schema_detection(df)
+    
+    def _fallback_schema_detection(self, df: pd.DataFrame) -> Dict:
+        """Rule-based schema detection as fallback"""
+        numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+        categorical_cols = df.select_dtypes(include=['object', 'category', 'string']).columns.tolist()
+        
+        # Detect date columns
+        date_cols = []
+        for col in df.columns:
+            lc = col.lower()
+            if 'date' in lc or 'time' in lc or 'month' in lc or 'year' in lc:
+                try:
+                    pd.to_datetime(df[col].head(10), errors='raise')
+                    date_cols.append(col)
+                except Exception:
+                    pass
+        
+        # Business heuristics
+        business_keywords = ['sales', 'sale', 'revenue', 'profit', 'cost', 'price', 'amount', 'value', 'qty', 'quantity', 'margin']
+        business_metrics = [col for col in numeric_cols if any(kw in col.lower() for kw in business_keywords)]
+        
+        groupby_candidates = [col for col in df.columns
+                              if (col in categorical_cols or col in date_cols) and df[col].nunique(dropna=True) < max(50, len(df) * 0.5)]
+        
+        id_keywords = ['id', 'key', 'code', 'number', 'uuid']
+        id_cols = [col for col in df.columns if any(kw in col.lower() for kw in id_keywords)]
+        
+        schema = {
+            "numeric_columns": numeric_cols,
+            "categorical_columns": categorical_cols,
+            "date_columns": date_cols,
+            "id_columns": id_cols,
+            "business_metrics": business_metrics or numeric_cols[:3],
+            "groupby_candidates": groupby_candidates[:10],
+            "primary_business_entities": groupby_candidates[:3],  # Top 3
+            "schema_insights": f"Dataset with {len(numeric_cols)} numeric and {len(categorical_cols)} categorical columns"
+        }
+        
+        st.session_state.detected_schema = schema
+        return schema
+    
+    def get_schema(self) -> Optional[Dict]:
+        return st.session_state.detected_schema
+
+schema_manager = SchemaManager()
+
+# ---------- Dynamic Heuristics Engine ----------
+class DynamicHeuristics:
+    def __init__(self, schema: Dict):
+        self.schema = schema or {}
+        
+    def try_heuristic_analysis(self, query: str, df: pd.DataFrame) -> Optional[str]:
+        """Apply dynamic heuristics based on detected schema"""
+        q = query.lower()
+        
+        # Basic info queries
+        if any(word in q for word in ["head", "first", "show rows"]):
+            n = self._extract_number(query) or 5
+            n = max(1, min(50, n))
+            return f"📊 **First {n} rows:**\n\n{df.head(n).to_string(index=False, max_cols=10)}"
+        
+        if "shape" in q or "size" in q:
+            return f"📏 **Dataset Shape:** {df.shape[0]} rows × {df.shape[1]} columns"
+        
+        if "columns" in q or "schema" in q:
+            return self._format_schema_info(df)
+        
+        # Aggregate queries using schema
+        if self._is_aggregate_query(q):
+            agg = self._handle_aggregates(query, df, q)
+            if agg:
+                return agg
+        
+        # Date-based queries
+        if self._is_date_query(q) and self.schema.get('date_columns'):
+            date_ans = self._handle_date_queries(query, df, q)
+            if date_ans:
+                return date_ans
+        
+        # Top/Bottom queries
+        if self._is_ranking_query(q):
+            rank = self._handle_ranking(query, df, q)
+            if rank:
+                return rank
+        
+        # Group by queries
+        if self._is_groupby_query(q):
+            gb = self._handle_groupby(query, df, q)
+            if gb:
+                return gb
+        
+        return None
+    
+    def _extract_number(self, text: str) -> Optional[int]:
+        nums = re.findall(r'\d+', text)
+        return int(nums[0]) if nums else None
+    
+    def _is_aggregate_query(self, q: str) -> bool:
+        agg_words = ["total", "sum", "average", "mean", "count", "max", "min"]
+        return any(word in q for word in agg_words)
+    
+    def _is_date_query(self, q: str) -> bool:
+        return any(word in q for word in ["on", "date", "day", "month", "year", "between"])
+    
+    def _is_ranking_query(self, q: str) -> bool:
+        return any(word in q for word in ["top", "bottom", "best", "worst", "highest", "lowest"])
+    
+    def _is_groupby_query(self, q: str) -> bool:
+        return any(word in q for word in [" by ", "group", " per ", " each "]) or "group by" in q
+    
+    def _format_schema_info(self, df: pd.DataFrame) -> str:
+        schema = self.schema
+        info = ["📋 **Dataset Schema:**", ""]
+        
+        if schema.get('business_metrics'):
+            info.append(f"💰 **Business Metrics:** {', '.join(schema['business_metrics'])}")
+        
+        if schema.get('groupby_candidates'):
+            info.append(f"📊 **Grouping Dimensions:** {', '.join(schema['groupby_candidates'])}")
+        
+        if schema.get('date_columns'):
+            info.append(f"📅 **Date Columns:** {', '.join(schema['date_columns'])}")
+        
+        info.append(f"\n**All Columns ({len(df.columns)}):**")
+        for col in df.columns:
+            info.append(f"• {col} ({df[col].dtype})")
+        
+        return "\n".join(info)
+    
+    def _handle_aggregates(self, query: str, df: pd.DataFrame, q: str) -> Optional[str]:
+        results = ["📊 **Aggregate Analysis:**", ""]
+        metrics = self.schema.get('business_metrics', self.schema.get('numeric_columns', []))
+        if not metrics:
+            return None
+        
+        for col in metrics[:6]:  # Limit to 6 columns
+            if col not in df.columns:
+                continue
+            try:
+                if "total" in q or "sum" in q:
+                    results.append(f"• Total {col}: {pd.to_numeric(df[col], errors='coerce').sum():,.2f}")
+                if "average" in q or "mean" in q:
+                    results.append(f"• Average {col}: {pd.to_numeric(df[col], errors='coerce').mean():,.2f}")
+                if "max" in q:
+                    results.append(f"• Maximum {col}: {pd.to_numeric(df[col], errors='coerce').max():,.2f}")
+                if "min" in q:
+                    results.append(f"• Minimum {col}: {pd.to_numeric(df[col], errors='coerce').min():,.2f}")
+                if "count" in q:
+                    results.append(f"• Count {col}: {df[col].count():,}")
+            except Exception:
+                continue
+                
+        return "\n".join(results) if len(results) > 2 else None
+    
+    def _handle_date_queries(self, query: str, df: pd.DataFrame, q: str) -> str:
+        date_cols = self.schema.get('date_columns', [])
+        if not date_cols:
+            return None
+            
+        # Extract date from query (YYYY-MM-DD)
+        dates = re.findall(r'\d{4}-\d{2}-\d{2}', query)
+        if not dates:
+            return "Please specify date in YYYY-MM-DD format"
+        
+        target_date = dates[0]
+        date_col = date_cols[0]
+        
+        try:
+            df_copy = df.copy()
+            df_copy[date_col] = pd.to_datetime(df_copy[date_col], errors='coerce')
+            filtered = df_copy[df_copy[date_col].dt.strftime('%Y-%m-%d') == target_date]
+            
+            if filtered.empty:
+                return f"No data found for {target_date}"
+            
+            results = [f"📅 **Analysis for {target_date} ({len(filtered)} records):**", ""]
+            
+            # Show key metrics if available
+            metrics = self.schema.get('business_metrics', [])
+            for metric in metrics[:3]:
+                if metric in filtered.columns:
+                    total = pd.to_numeric(filtered[metric], errors='coerce').sum()
+                    results.append(f"• {metric}: {total:,.2f}")
+            
+            results.append(f"\n**Sample Records:**\n{filtered.head(5).to_string(index=False, max_cols=8)}")
+            return "\n".join(results)
+            
+        except Exception as e:
+            return f"Date analysis error: {stringify_exception(e)}"
+    
+    def _handle_ranking(self, query: str, df: pd.DataFrame, q: str) -> str:
+        n = self._extract_number(query) or 5
+        n = max(1, min(50, n))
+        
+        # Find the metric to rank by
+        metrics = self.schema.get('business_metrics', self.schema.get('numeric_columns', []))
+        groupby_cols = self.schema.get('groupby_candidates', [])
+        
+        if not metrics or not groupby_cols:
+            return None
+        
+        try:
+            metric_col = metrics[0]  # Use first business metric
+            group_col = groupby_cols[0]  # Use first grouping column
+            
+            s = pd.to_numeric(df[metric_col], errors='coerce')
+            tmp = df.assign(_metric=s)
+            grouped = tmp.groupby(group_col)["_metric"].sum()
+            
+            if "top" in q or "best" in q or "highest" in q:
+                ranked = grouped.nlargest(n)
+                direction = "Top"
+            else:  # bottom, worst, lowest
+                ranked = grouped.nsmallest(n)
+                direction = "Bottom"
+            
+            results = [f"🏆 **{direction} {n} {group_col} by {metric_col}:**", ""]
+            for idx, (name, value) in enumerate(ranked.items(), 1):
+                results.append(f"{idx}. {name}: {value:,.2f}")
+            return "\n".join(results)
+            
+        except Exception as e:
+            return f"Ranking analysis error: {stringify_exception(e)}"
+    
+    def _handle_groupby(self, query: str, df: pd.DataFrame, q: str) -> str:
+        groupby_cols = self.schema.get('groupby_candidates', [])
+        metrics = self.schema.get('business_metrics', self.schema.get('numeric_columns', []))
+        
+        if not groupby_cols or not metrics:
+            return None
+        
+        try:
+            # Find mentioned columns in query
+            group_col = None
+            metric_col = None
+            
+            for col in groupby_cols:
+                if col.lower() in q:
+                    group_col = col
+                    break
+            
+            for col in metrics:
+                if col.lower() in q:
+                    metric_col = col
+                    break
+            
+            # Use defaults if not found
+            group_col = group_col or groupby_cols[0]
+            metric_col = metric_col or metrics[0]
+            
+            # Determine aggregation type
+            s = pd.to_numeric(df[metric_col], errors='coerce')
+            tmp = df.assign(_metric=s)
+            if "total" in q or "sum" in q:
+                grouped = tmp.groupby(group_col)["_metric"].sum()
+                label = "sum"
+            elif "average" in q or "mean" in q:
+                grouped = tmp.groupby(group_col)["_metric"].mean()
+                label = "mean"
+            elif "count" in q:
+                grouped = df.groupby(group_col).size()
+                label = "count"
+            else:
+                grouped = tmp.groupby(group_col)["_metric"].sum()
+                label = "sum"
+            
+            results = [f"📈 **{metric_col} ({label}) by {group_col}:**", ""]
+            head = grouped.sort_values(ascending=False).head(10)
+            for name, value in head.items():
+                if isinstance(value, (int, float)):
+                    results.append(f"• {name}: {value:,.2f}")
+                else:
+                    results.append(f"• {name}: {value:,}")
+            
+            return "\n".join(results)
+            
+        except Exception as e:
+            return f"Group-by analysis error: {stringify_exception(e)}"
+
+# ---------- Cached resources ----------
+
+@st.cache_resource(show_spinner=False)
+def get_embeddings():
+    try:
+        return HuggingFaceEmbeddings(model_name=EMBED_MODEL)
+    except Exception as e:
+        st.warning(f"Embeddings init failed: {stringify_exception(e)}")
+        return None
+
+@st.cache_resource(show_spinner=False)
+def get_vector_store():
+    if not os.path.exists(CHROMA_DIR):
+        return None
+    try:
+        embs = get_embeddings()
+        if not embs:
+            return None
+        return Chroma(persist_directory=CHROMA_DIR, embedding_function=embs)
+    except Exception as e:
+        st.warning(f"Chroma init failed: {stringify_exception(e)}")
+        return None
+
+@st.cache_resource(show_spinner=False)
 def initialize_llms():
-    """Initialize both Ollama and Gemini LLMs with error handling"""
+    """Initialize both Ollama (local) and Gemini (cloud) once."""
     ollama_llm = None
     gemini_llm = None
-    
+
+    # Ollama
     try:
-        # Lightweight Ollama for basic tasks
         ollama_llm = OllamaLLM(
             model="llama2:latest",
             temperature=0,
-            num_predict=200,  # Short responses for basic queries
+            num_predict=200,
             top_p=0.9,
             repeat_penalty=1.1,
-            num_ctx=1024,  # Smaller context for efficiency
+            num_ctx=1024,
             top_k=20,
         )
-        st.success("🦙 Ollama LLM initialized")
     except Exception as e:
-        st.warning(f"⚠️ Ollama initialization failed: {str(e)}")
-    
+        st.warning(f"⚠️ Ollama initialization failed: {stringify_exception(e)}")
+
+    # Gemini
     try:
-        # ✅ Load Gemini API key from .env
-        gemini_api_key = os.getenv("GEMINI_API_KEY")
-        
-        if gemini_api_key:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if api_key:
             gemini_llm = ChatGoogleGenerativeAI(
-                model="gemini-2.5-pro",
-                google_api_key=gemini_api_key,
+                model="gemini-2.0-flash-exp",
+                google_api_key=api_key,
                 temperature=0.1,
-                convert_system_message_to_human=True
+                convert_system_message_to_human=True,
             )
-            st.success("💎 Gemini LLM initialized")
         else:
-            st.warning("⚠️ Gemini API key not found. Please set GEMINI_API_KEY in your .env file.")
-            
+            st.warning("⚠️ GEMINI_API_KEY missing in .env")
     except Exception as e:
-        st.warning(f"⚠️ Gemini initialization failed: {str(e)}")
-    
+        st.warning(f"⚠️ Gemini initialization failed: {stringify_exception(e)}")
+
     return ollama_llm, gemini_llm
 
-def classify_query_complexity(query):
-    """Classify query as BASIC, MODERATE, or COMPLEX"""
-    query_lower = query.lower()
-    
-    # BASIC queries - use Ollama (fast, local)
-    basic_indicators = [
-        "head", "first", "show", "display", "columns", "shape", "size", 
-        "describe", "info", "summary", "list", "what are", "how many"
-    ]
-    
-    # COMPLEX queries - use Gemini (advanced reasoning)
-    complex_indicators = [
-        "analyze", "insights", "trends", "patterns", "correlations", 
-        "predictions", "recommendations", "optimize", "compare", "contrast",
-        "what if", "scenario", "forecast", "model", "relationship",
-        "anomal", "outlier", "cluster", "segment", "classify"
-    ]
-    
-    # MODERATE queries - try Ollama first, fallback to Gemini
-    moderate_indicators = [
-        "total", "sum", "average", "mean", "max", "min", "count",
-        "group by", "filter", "where", "sort", "rank", "top",
-        "calculate", "compute", "find", "search", "get"
-    ]
-    
-    # Time-based or conditional complexity
-    time_complexity = any(word in query_lower for word in ["on", "between", "during", "when", "before", "after"])
-    conditional_complexity = any(word in query_lower for word in ["if", "where", "condition", "criteria"])
-    multiple_operations = query_lower.count("and") > 1 or query_lower.count("or") > 1
-    
-    # Classification logic
-    if any(indicator in query_lower for indicator in complex_indicators):
-        return "COMPLEX"
-    elif any(indicator in query_lower for indicator in basic_indicators):
-        return "BASIC"
-    elif (time_complexity and conditional_complexity) or multiple_operations:
-        return "COMPLEX"
-    elif any(indicator in query_lower for indicator in moderate_indicators):
-        return "MODERATE"
-    else:
-        # Default classification based on query length and complexity
-        if len(query.split()) > 10 or len(re.findall(r'[0-9]{4}', query)) > 1:
-            return "COMPLEX"
-        else:
-            return "BASIC"
-
-def create_ollama_agent(df):
-    """Create lightweight Ollama agent for basic queries"""
+@st.cache_resource(show_spinner=False)
+def load_sales_data(path: str):
+    """Load CSV to DataFrame with minimal sanity checks."""
+    if not os.path.exists(path):
+        return None, f"Missing data file at {path}"
     try:
-        ollama_llm, _ = initialize_llms()
-        if not ollama_llm:
-            return None
-            
-        agent = create_pandas_dataframe_agent(
+        df = pd.read_csv(path)
+        # Optional: ensure datetime if any column named like 'date'
+        for col in df.columns:
+            if "date" in col.lower():
+                with pd.option_context("mode.chained_assignment", None):
+                    try:
+                        df[col] = pd.to_datetime(df[col], errors="ignore")
+                    except Exception:
+                        pass
+        return df, None
+    except Exception as e:
+        return None, f"Failed to load data: {stringify_exception(e)}"
+
+# ---------- Agent builders ----------
+
+def create_ollama_agent(df: pd.DataFrame, ollama_llm: OllamaLLM):
+    if not ollama_llm:
+        return None
+    try:
+        return create_pandas_dataframe_agent(
             llm=ollama_llm,
             df=df,
             verbose=False,
             allow_dangerous_code=True,
-            max_iterations=100,  # Limited iterations for speed
+            handle_parsing_errors=True,
+            max_iterations=100,
             agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
         )
-        return agent
     except Exception as e:
-        st.warning(f"Ollama agent creation failed: {str(e)}")
+        st.warning(f"Ollama agent creation failed: {stringify_exception(e)}")
         return None
 
-def create_gemini_agent(df):
-    """Create powerful Gemini agent for complex queries"""
+def create_gemini_agent(df: pd.DataFrame, gemini_llm: ChatGoogleGenerativeAI):
+    if not gemini_llm:
+        return None
     try:
-        _, gemini_llm = initialize_llms()
-        if not gemini_llm:
-            return None
-            
-        agent = create_pandas_dataframe_agent(
+        return create_pandas_dataframe_agent(
             llm=gemini_llm,
             df=df,
             verbose=False,
             allow_dangerous_code=True,
             handle_parsing_errors=True,
-            max_iterations=100,  # More iterations for complex analysis
+            max_iterations=100,
             agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
         )
-        return agent
     except Exception as e:
-        st.warning(f"Gemini agent creation failed: {str(e)}")
+        st.warning(f"Gemini agent creation failed: {stringify_exception(e)}")
         return None
 
-def preprocess_query_for_llm(query, df, llm_type):
-    """Preprocess query based on LLM type"""
-    if llm_type == "OLLAMA":
-        # Simple, direct instructions for Ollama
-        return f"""Answer this question about the dataframe: {query}
+# ---------- Query routing with schema-aware classification ----------
 
-Dataframe info:
-- Columns: {list(df.columns)}
-- Shape: {df.shape}
+def classify_query_complexity(query: str, schema: Dict) -> str:
+    """Enhanced classification using schema information"""
+    q = query.lower()
 
-Use python_repl_ast tool to execute pandas code."""
+    # Schema-aware indicators
+    business_entities = schema.get('primary_business_entities', []) or []
+    business_metrics = schema.get('business_metrics', []) or []
     
+    basic_indicators = [
+        "head", "first", "show", "display", "columns", "shape", "size",
+        "describe", "info", "summary", "list", "what are", "how many",
+        "unique", "value counts", "schema"
+    ]
+    
+    complex_indicators = [
+        "analyze", "insights", "trends", "patterns", "correlations",
+        "predictions", "recommendations", "optimize", "compare", "contrast",
+        "what if", "scenario", "forecast", "model", "relationship",
+        "anomal", "outlier", "cluster", "segment", "classify", "predict",
+        "regression", "time series", "seasonality"
+    ]
+    
+    moderate_indicators = [
+        "total", "sum", "average", "mean", "max", "min", "count",
+        "group by", "filter", "where", "sort", "rank", "top", "bottom",
+        "calculate", "compute", "find", "search", "get", " by "
+    ]
+
+    # Enhanced detection using schema
+    mentions_multiple_entities = sum(1 for entity in business_entities if entity.lower() in q) > 1
+    mentions_multiple_metrics = sum(1 for metric in business_metrics if metric.lower() in q) > 1
+    has_comparison_words = any(word in q for word in [" vs ", "versus", "compare", "against", " between "])
+    has_time_analysis = any(word in q for word in ["trend", "over time", "growth", "change", "month over month", "year over year"])
+
+    # Classification logic
+    if any(x in q for x in complex_indicators) or has_comparison_words or has_time_analysis:
+        return "COMPLEX"
+    if any(x in q for x in basic_indicators) and not (mentions_multiple_entities or mentions_multiple_metrics):
+        return "SIMPLE"
+    if mentions_multiple_entities or mentions_multiple_metrics:
+        return "COMPLEX"
+    if any(x in q for x in moderate_indicators):
+        return "MEDIUM"
+
+    # Fallback heuristic
+    if len(query.split()) > 12:
+        return "COMPLEX"
+    return "SIMPLE"
+
+def preprocess_query_for_llm(query: str, df: pd.DataFrame, llm_type: str, schema: Dict) -> str:
+    """Enhanced preprocessing with schema context"""
+    
+    if llm_type == "OLLAMA":
+        schema_context = f"""
+Schema Info:
+- Business Metrics: {schema.get('business_metrics', [])}
+- Group-by Columns: {schema.get('groupby_candidates', [])}
+- Date Columns: {schema.get('date_columns', [])}
+"""
+        return f"""You are a data assistant. Answer concisely using pandas.
+
+{schema_context}
+Question: {query}
+
+DataFrame: {df.shape[0]} rows × {df.shape[1]} cols
+Columns: {list(df.columns)}
+
+Use python tool for pandas operations."""
     elif llm_type == "GEMINI":
-        # Detailed context and instructions for Gemini
-        return f"""You are a data analysis expert. Analyze this dataframe and answer the question comprehensively.
+        head_sample = df.head(2).to_string(index=False, max_cols=8)
+        schema_insights = schema.get('schema_insights', 'Business dataset')
+        
+        return f"""You are a senior data analyst. Provide comprehensive analysis.
 
-Dataset Information:
-- Columns: {list(df.columns)}
+Dataset Context: {schema_insights}
 - Shape: {df.shape[0]} rows × {df.shape[1]} columns
-- Data types: {dict(df.dtypes)}
+- Key Business Metrics: {schema.get('business_metrics', [])}
+- Grouping Dimensions: {schema.get('groupby_candidates', [])}
+- Date Columns: {schema.get('date_columns', [])}
 
-Sample data:
-{df.head(2).to_string()}
+Sample Data:
+{head_sample}
 
 Question: {query}
 
-Please provide:
-1. Direct answer to the question
-2. Key insights from the analysis
-3. Any notable patterns or recommendations
+Provide:
+1. Direct answer with specific numbers
+2. Business insights and patterns
+3. Actionable recommendations (if applicable)
 
-Use the python_repl_ast tool to execute pandas operations."""
-    
+Use python tool for complex pandas operations."""
     return query
 
-def execute_hybrid_agent_strategy(query, df):
-    """Execute hybrid strategy based on query complexity"""
-    
-    # Classify query complexity
-    complexity = classify_query_complexity(query)
-    st.info(f"🎯 Query classified as: **{complexity}**")
-    
-    if complexity == "BASIC":
-        return execute_basic_strategy(query, df)
-    elif complexity == "MODERATE": 
-        return execute_moderate_strategy(query, df)
-    else:  # COMPLEX
-        return execute_complex_strategy(query, df)
+# ---------- Pandas helpers ----------
 
-def execute_basic_strategy(query, df):
-    """Handle basic queries with Ollama or direct analysis"""
-    st.info("⚡ Using fast local analysis for basic query...")
+def try_direct_pandas_operations(query: str, df: pd.DataFrame) -> Optional[str]:
+    """Direct pandas operations without LLM"""
+    q = query.lower()
     
-    # Try direct analysis first for very basic queries
-    direct_result = try_direct_analysis(query, df)
-    if direct_result:
-        return f"🦙 **Ollama Local Analysis:**\n\n{direct_result}"
+    if "describe" in q:
+        return df.describe(include='all', datetime_is_numeric=True).to_string()
     
-    # Try Ollama agent
-    ollama_agent = create_ollama_agent(df)
-    if ollama_agent:
-        try:
-            processed_query = preprocess_query_for_llm(query, df, "OLLAMA")
-            result = ollama_agent.invoke(processed_query)
-            
-            output = result.get("output", str(result)) if isinstance(result, dict) else str(result)
-            if output and len(output.strip()) > 10:
-                return f"🦙 **Ollama Analysis:**\n\n{output}"
-        except Exception:
-            st.warning("⚠️ Ollama couldn’t handle this query, switching to fallback...")
+    if "info" in q:
+        mem_mb = df.memory_usage(deep=True).sum() / 1024**2
+        return f"Dataset Info:\n{df.dtypes.to_string()}\n\nMemory usage: {mem_mb:.2f} MB"
     
-    # Fallback to enhanced direct analysis
-    return enhanced_fallback_analysis(df, query)
+    if "nunique" in q or "unique" in q:
+        return f"Unique values per column:\n{df.nunique(dropna=True).to_string()}"
 
-
-def execute_moderate_strategy(query, df):
-    """Handle moderate queries - try Ollama first, then Gemini"""
-    st.info("🔄 Using hybrid approach for moderate complexity query...")
-    
-    # Try Ollama first (faster)
-    ollama_agent = create_ollama_agent(df)
-    if ollama_agent:
-        try:
-            processed_query = preprocess_query_for_llm(query, df, "OLLAMA")
-            result = ollama_agent.invoke(processed_query)
-            
-            output = result.get("output", str(result)) if isinstance(result, dict) else str(result)
-            if output and len(output.strip()) > 20 and "error" not in output.lower():
-                return f"🦙 **Ollama Analysis:**\n\n{output}"
-        except Exception:
-            st.info("Switching directly to Gemini....")
-    
-    # Fallback to Gemini for better analysis
-    return execute_complex_strategy(query, df)
-
-def execute_complex_strategy(query, df):
-    """Handle complex queries with Gemini"""
-    st.info("💎 Using advanced Gemini analysis for complex query...")
-    
-    gemini_agent = create_gemini_agent(df)
-    if gemini_agent:
-        try:
-            processed_query = preprocess_query_for_llm(query, df, "GEMINI")
-            
-            with st.spinner("🧠 Gemini is performing advanced analysis..."):
-                result = gemini_agent.invoke(processed_query)
-            
-            output = result.get("output", str(result)) if isinstance(result, dict) else str(result)
-            if output and len(output.strip()) > 10:
-                return f"💎 **Gemini Advanced Analysis:**\n\n{output}"
-                
-        except Exception as e:
-            st.warning(f"Gemini analysis failed: {str(e)}")
-    
-    # Final fallback to enhanced analysis
-    st.info("🔧 Using enhanced fallback analysis...")
-    return enhanced_fallback_analysis(df, query)
-
-def try_direct_analysis(query, df):
-    """Quick direct analysis for very basic queries"""
-    query_lower = query.lower()
-    
-    # Very basic operations that don't need LLM
-    if "head" in query_lower or "first" in query_lower:
-        n = extract_number_from_query(query) or 5
-        return f"First {n} rows:\n\n{df.head(n).to_string(index=False)}"
-    
-    elif "shape" in query_lower or "size" in query_lower:
-        return f"Dataset shape: {df.shape[0]} rows × {df.shape[1]} columns"
-    
-    elif "columns" in query_lower:
-        return f"Columns: {', '.join(df.columns)}\n\nColumn details:\n" + "\n".join([f"• {col} ({df[col].dtype})" for col in df.columns])
-    
-    elif "describe" in query_lower and len(query.split()) <= 3:
-        return f"Dataset description:\n\n{df.describe().to_string()}"
-    
-    elif "unique" in query_lower:
-        return f"Unique values per column:\n\n{df.nunique().to_string()}"
-    
-    elif "value counts" in query_lower:
-        # Try to detect column name from query, fallback to first column
-        detected_col = None
-        for col in df.columns:
-            if col.lower() in query_lower:
-                detected_col = col
-                break
-        col = detected_col or df.columns[0]
-        return f"Value counts for '{col}':\n\n{df[col].value_counts().to_string()}"
+    if "columns" in q:
+        cols = [f"{c} ({df[c].dtype})" for c in df.columns]
+        return "Columns:\n" + "\n".join(cols)
     
     return None
 
-def enhanced_fallback_analysis(df, query):
-    """Enhanced fallback analysis for when agents fail"""
+def run_pandas_agent(query: str, df: pd.DataFrame, gemini_llm=None, ollama_llm=None) -> Optional[str]:
+    """
+    Execute query using a Pandas agent.
+    Prefers Gemini if available, otherwise Ollama.
+    """
+    agent = None
     try:
-        query_lower = query.lower()
-        
-        # Dynamic column detection
-        numeric_columns = df.select_dtypes(include=['number']).columns.tolist()
-        text_columns = df.select_dtypes(include=['object']).columns.tolist()
-        date_columns = detect_date_columns(df)
-        
-        # Handle different query types
-        if any(viz_word in query_lower for viz_word in ["plot", "graph", "chart", "visualize"]):
-            return handle_visualization_analysis(df, query, numeric_columns, text_columns)
-        
-        elif any(analysis_word in query_lower for analysis_word in ["analyze", "analysis", "insights", "trends"]):
-            return handle_comprehensive_analysis(df, query, numeric_columns, text_columns, date_columns)
-        
-        elif any(date_word in query_lower for date_word in ["on", "date", "day"]) and date_columns:
-            return handle_date_specific_analysis(df, query, query_lower, date_columns, numeric_columns)
-        
-        elif any(agg_word in query_lower for agg_word in ["total", "sum", "average", "mean"]) and numeric_columns:
-            return handle_aggregation_analysis(df, query, query_lower, numeric_columns)
-        
-        else:
-            return generate_helpful_response(df, query)
-        
+        if gemini_llm:
+            agent = create_gemini_agent(df, gemini_llm)
+        if not agent and ollama_llm:
+            agent = create_ollama_agent(df, ollama_llm)
+        if not agent:
+            st.warning("No LLM available for Pandas agent.")
+            return None
+        res = agent.invoke({"input": query})
+        return safe_extract_output(res)
     except Exception as e:
-        return f"Analysis error: {str(e)}\n\nDataset info: {df.shape[0]} rows, {df.shape[1]} columns"
+        st.warning(f"Pandas agent failed: {stringify_exception(e)}")
+        return None
 
-def detect_date_columns(df):
-    """Detect potential date columns"""
-    date_columns = []
-    for col in df.columns:
-        try:
-            pd.to_datetime(df[col].head(10), errors='raise')
-            date_columns.append(col)
-        except:
-            continue
-    return date_columns
+# ---------- Knowledge Base search ----------
 
-def handle_visualization_analysis(df, query, numeric_cols, text_cols):
-    """Provide visualization insights"""
-    return f"""📊 **Visualization Analysis for:** {query}
-
-**Recommended Charts:**
-{f"• Histogram: {numeric_cols[0]} distribution" if numeric_cols else ""}
-{f"• Bar Chart: {text_cols[0]} categories" if text_cols else ""}
-{f"• Scatter Plot: {numeric_cols[0]} vs {numeric_cols[1]}" if len(numeric_cols) > 1 else ""}
-
-**Data Summary:**
-{df.describe().to_string() if numeric_cols else "No numeric data for statistics"}
-"""
-
-def handle_comprehensive_analysis(df, query, numeric_cols, text_cols, date_cols):
-    """Provide comprehensive data analysis"""
-    analysis = f"📈 **Comprehensive Analysis for:** {query}\n\n"
-    
-    # Statistical summary
-    if numeric_cols:
-        analysis += "**📊 Statistical Summary:**\n"
-        for col in numeric_cols:
-            stats = df[col].agg(['mean', 'std', 'min', 'max'])
-            analysis += f"• {col}: Mean={stats['mean']:.2f}, Std={stats['std']:.2f}, Range=[{stats['min']}-{stats['max']}]\n"
-    
-    # Categorical analysis
-    if text_cols:
-        analysis += "\n**📋 Categorical Analysis:**\n"
-        for col in text_cols:
-            top_3 = df[col].value_counts().head(3)
-            analysis += f"• {col}: {df[col].nunique()} unique values, Top 3: {dict(top_3)}\n"
-    
-    # Correlation analysis
-    if len(numeric_cols) > 1:
-        corr_matrix = df[numeric_cols].corr()
-        analysis += f"\n**🔗 Correlations:**\n{corr_matrix.to_string()}\n"
-    
-    return analysis
-
-def handle_date_specific_analysis(df, query, query_lower, date_cols, numeric_cols):
-    """Handle date-specific queries"""
-    dates = re.findall(r'\d{4}-\d{2}-\d{2}', query)
-    if not dates:
-        return "Could not extract valid date. Use format like '2023-01-02'"
-    
-    date_col = date_cols[0]
-    target_date = dates[0]
-    
+def kb_search(query: str) -> str:
+    vs = get_vector_store()
+    if not vs:
+        return "📝 No knowledge base available."
     try:
-        df_copy = df.copy()
-        df_copy[date_col] = pd.to_datetime(df_copy[date_col]).dt.strftime('%Y-%m-%d')
-        filtered_df = df_copy[df_copy[date_col] == target_date]
-        
-        if filtered_df.empty:
-            return f"No data found for {target_date}"
-        
-        result = f"📅 **Analysis for {target_date}:**\n\n"
-        
-        if "total" in query_lower and numeric_cols:
-            for col in numeric_cols:
-                total = filtered_df[col].sum()
-                result += f"• Total {col}: {total:,}\n"
-        
-        result += f"\n**Records ({len(filtered_df)}):**\n{filtered_df.to_string(index=False)}"
-        return result
-        
+        docs = vs.similarity_search(query, k=3)
+        if not docs:
+            return "❓ No relevant information found in knowledge base."
+        items = []
+        for i, d in enumerate(docs, 1):
+            content = d.page_content[:1200]
+            items.append(f"**{i}.** {content}")
+        return "📖 **Knowledge Base Results:**\n\n" + "\n\n".join(items)
     except Exception as e:
-        return f"Date analysis error: {str(e)}"
+        return f"❌ Knowledge base search failed: {stringify_exception(e)}"
 
-def handle_aggregation_analysis(df, query, query_lower, numeric_cols):
-    """Handle aggregation queries"""
-    result = "📊 **Aggregation Analysis:**\n\n"
-    
-    for col in numeric_cols:
-        if "total" in query_lower or "sum" in query_lower:
-            result += f"• Total {col}: {df[col].sum():,}\n"
-        if "average" in query_lower or "mean" in query_lower:
-            result += f"• Average {col}: {df[col].mean():.2f}\n"
-        if "max" in query_lower:
-            result += f"• Maximum {col}: {df[col].max():,}\n"
-        if "min" in query_lower:
-            result += f"• Minimum {col}: {df[col].min():,}\n"
-    
-    return result
+# ---------- Execution strategies with fallback ----------
 
-def generate_helpful_response(df, query):
-    """Generate helpful response for unmatched queries"""
-    numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
-    text_cols = df.select_dtypes(include=['object']).columns.tolist()
+def enhanced_fallback_analysis(df: pd.DataFrame, query: str, schema: Dict) -> str:
+    """Enhanced fallback using schema information"""
+    try:
+        heuristics = DynamicHeuristics(schema)
+        result = heuristics.try_heuristic_analysis(query, df)
+        if result:
+            return result
+        return generate_helpful_response(df, query, schema)
+    except Exception as e:
+        return f"Analysis error: {stringify_exception(e)}\n\nDataset: {df.shape[0]} rows, {df.shape[1]} cols"
+
+def generate_helpful_response(df: pd.DataFrame, query: str, schema: Dict) -> str:
+    """Generate helpful response using schema context"""
+    sample = df.head(2).to_string(index=False, max_cols=8)
+    business_metrics = schema.get('business_metrics', [])
+    groupby_cols = schema.get('groupby_candidates', [])
     
     return f"""🤔 **Query:** "{query}"
 
-**💡 What I can help with:**
+**💡 What I can analyze:**
 
-**Basic Queries (⚡ Fast Local):**
-- "Show first 5 rows" 
-- "Describe the data"
-- "What columns are available?"
+**⚡ Simple (Heuristics + Local):**
+- Show first N rows, describe data, column info
+- Basic aggregates: total, average, count
+- Simple filtering by date or category
 
-**Moderate Queries (🔄 Hybrid):**
-- "Total sales" / "Average sales"
-- "Data for specific date"
-- "Filter and summarize"
+**🔄 Medium (Ollama + Fallbacks):**
+- Group by analysis: {', '.join(groupby_cols[:3]) if groupby_cols else 'categories'}
+- Business metrics: {', '.join(business_metrics[:3]) if business_metrics else 'calculations'}
+- Rankings and comparisons
 
-**Complex Queries (💎 Advanced AI):**
-- "Analyze trends and patterns"
-- "Provide insights and recommendations" 
-- "Compare and correlate data"
+**💎 Complex (Gemini + Advanced):**
+- Trend analysis and forecasting
+- Multi-dimensional correlations
+- Business insights and recommendations
+- Scenario modeling
 
-**📊 Your Dataset:**
-- {df.shape[0]} rows × {df.shape[1]} columns
-- Numeric: {numeric_cols}
-- Text: {text_cols}
+**📊 Your Dataset Context:**
+- **Shape:** {df.shape[0]} rows × {df.shape[1]} columns  
+- **Key Metrics:** {business_metrics[:4] if business_metrics else 'Not detected'}
+- **Dimensions:** {groupby_cols[:4] if groupby_cols else 'Not detected'}
+- **Schema Insight:** {schema.get('schema_insights', 'Business dataset')}
 
-**Sample:** 
-{df.head(2).to_string(index=False)}
+**Sample:**
+{sample}
 """
 
-def extract_number_from_query(query):
-    """Extract number from query"""
-    numbers = re.findall(r'\d+', query)
-    return int(numbers[0]) if numbers else None
-
-def run_agent(query):
-    """Main function with hybrid LLM strategy"""
+def execute_simple_strategy(query: str, df: pd.DataFrame, schema: Dict, ollama_llm) -> Tuple[str, str]:
+    """Simple queries: Heuristics → Pandas Direct → Ollama (fallback)"""
+    start_time = time.time()
     
-    # Check data file
-    if not os.path.exists("data/sales_data.csv"):
-        st.error("❌ sales_data.csv not found in /data folder!")
-        return "Error: Data file not found."
-            
-    # Load data
+    # 1. Try dynamic heuristics first
+    heuristics = DynamicHeuristics(schema)
+    heuristic_result = heuristics.try_heuristic_analysis(query, df)
+    
+    if heuristic_result:
+        execution_time = time.time() - start_time
+        tracker.log_query(query, "SIMPLE", "heuristic", True, execution_time)
+        return heuristic_result, "heuristic"
+    
+    # 2. Try Pandas Direct
     try:
-        df = pd.read_csv("data/sales_data.csv")
-        st.success(f"✅ Data loaded: {df.shape[0]} rows × {df.shape[1]} columns")
-        
-        with st.expander("📊 Data Preview"):
-            col1, col2 = st.columns(2)
-            with col1:
-                st.write("**Columns & Types:**")
-                for col in df.columns:
-                    st.write(f"• {col} ({df[col].dtype})")
-            with col2:
-                st.write("**Sample Data:**")
-                st.dataframe(df.head())
-                
-    except Exception as e:
-        st.error(f"❌ Error loading data: {str(e)}")
-        return "Error loading data."
-        
-    # Route query
-    sales_keywords = ["sales", "data", "df", "total", "average", "analyze", "show", "product", "region"]
-    is_sales_query = any(keyword in query.lower() for keyword in sales_keywords)
-        
-    if is_sales_query:
-        st.info("🔍 Routing to hybrid LLM analysis...")
-        return execute_hybrid_agent_strategy(query, df)
-    else:
-        # Knowledge base search
-        st.info("📚 Searching knowledge base...")
-        if os.path.exists("./chroma_db"):
+        result = try_direct_pandas_operations(query, df)
+        if result:
+            execution_time = time.time() - start_time
+            tracker.log_query(query, "SIMPLE", "pandas_direct", True, execution_time)
+            return f"🐼 **Direct Pandas Analysis:**\n\n{result}", "pandas_direct"
+    except Exception:
+        pass
+    
+    # 3. Fallback to Ollama agent (fast local)
+    if ollama_llm:
+        agent = create_ollama_agent(df, ollama_llm)
+        if agent:
             try:
-                embeddings = HuggingFaceEmbeddings()
-                vector_store = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
-                docs = vector_store.similarity_search(query, k=3)
-                if docs:
-                    return "📖 **Knowledge Base Results:**\n\n" + "\n\n".join([f"**{i+1}.** {doc.page_content}" for i, doc in enumerate(docs)])
-                else:
-                    return "❓ No relevant information found in knowledge base."
+                prompt = preprocess_query_for_llm(query, df, "OLLAMA", schema)
+                res = agent.invoke({"input": prompt})
+                output = safe_extract_output(res)
+                if output.strip():
+                    execution_time = time.time() - start_time
+                    tracker.log_query(query, "SIMPLE", "ollama", True, execution_time)
+                    return f"🦙 **Ollama Analysis:**\n\n{output}", "ollama"
             except Exception as e:
-                return f"❌ Knowledge base error: {str(e)}"
+                st.warning(f"Ollama failed: {stringify_exception(e)}")
+    
+    # 4. Final fallback
+    execution_time = time.time() - start_time
+    tracker.log_query(query, "SIMPLE", "fallback", False, execution_time)
+    return generate_helpful_response(df, query, schema), "fallback"
+
+def execute_medium_strategy(query: str, df: pd.DataFrame, schema: Dict, ollama_llm, gemini_llm) -> Tuple[str, str]:
+    """Medium queries: Ollama → Pandas Agent → Gemini (fallback)"""
+    start_time = time.time()
+    
+    # 1. Try Ollama first (local, fast)
+    if ollama_llm:
+        agent = create_ollama_agent(df, ollama_llm)
+        if agent:
+            try:
+                prompt = preprocess_query_for_llm(query, df, "OLLAMA", schema)
+                res = agent.invoke({"input": prompt})
+                output = safe_extract_output(res)
+                if output.strip() and len(output) > 50 and "error" not in output.lower():
+                    execution_time = time.time() - start_time
+                    tracker.log_query(query, "MEDIUM", "ollama", True, execution_time)
+                    return f"🦙 **Ollama Analysis:**\n\n{output}", "ollama"
+                else:
+                    st.info("⚠️ Ollama returned a weak/empty response → Trying Pandas Agent…")
+            except Exception:
+                st.info("⚠️ Ollama failed → Trying Pandas Agent…")
+
+    # 2. Fallback → Pandas Agent
+    try:
+        pandas_res = run_pandas_agent(query, df, gemini_llm=gemini_llm, ollama_llm=ollama_llm)
+        if pandas_res and isinstance(pandas_res, str) and len(pandas_res.strip()) > 10:
+            execution_time = time.time() - start_time
+            tracker.log_query(query, "MEDIUM", "pandas-agent", True, execution_time)
+            return f"🐼 **Pandas Agent Analysis:**\n\n{pandas_res}", "pandas-agent"
         else:
-            return "📝 No knowledge base available."
+            st.info("⚠️ Pandas Agent returned nothing useful → Trying Gemini…")
+    except Exception:
+        st.info("⚠️ Pandas Agent failed → Trying Gemini…")
 
-# Streamlit UI
-st.set_page_config(page_title="Hybrid AI Agents", page_icon="🤖", layout="wide")
+    # 3. Final fallback → Gemini (delegates to complex path)
+    return execute_complex_strategy(query, df, schema, gemini_llm)
 
-st.title("🤖 Hybrid AI Data Analysis Agents")
-st.markdown("*Intelligent routing: Ollama for speed 🦙 • Gemini for complexity 💎*")
+def execute_complex_strategy(query: str, df: pd.DataFrame, schema: Dict, gemini_llm) -> Tuple[str, str]:
+    """Complex queries: Gemini → Pandas Agent (fallback) → Enhanced fallback"""
+    start_time = time.time()
+    
+    # 1. Try Gemini for advanced reasoning
+    if gemini_llm:
+        agent = create_gemini_agent(df, gemini_llm)
+        if agent:
+            try:
+                prompt = preprocess_query_for_llm(query, df, "GEMINI", schema)
+                with st.spinner("🧠 Gemini analyzing..."):
+                    res = agent.invoke({"input": prompt})
+                output = safe_extract_output(res)
+                if output.strip():
+                    execution_time = time.time() - start_time
+                    tracker.log_query(query, "COMPLEX", "gemini", True, execution_time)
+                    return f"💎 **Gemini Advanced Analysis:**\n\n{output}", "gemini"
+                else:
+                    st.info("⚠️ Gemini returned an empty response → Trying Pandas Agent…")
+            except Exception as e:
+                st.warning(f"Gemini API failed: {stringify_exception(e)}")
 
-# Initialize LLMs and show status
+    # 2. Fallback → Pandas Agent (LLM-agnostic: Gemini if available else Ollama)
+    try:
+        pandas_res = run_pandas_agent(query, df, gemini_llm=gemini_llm, ollama_llm=None)
+        if pandas_res and isinstance(pandas_res, str) and len(pandas_res.strip()) > 10:
+            execution_time = time.time() - start_time
+            tracker.log_query(query, "COMPLEX", "pandas-agent", True, execution_time)
+            return f"🐼 **Pandas Agent (Complex Fallback):**\n\n{pandas_res}", "pandas-agent"
+    except Exception:
+        st.info("⚠️ Pandas Agent also failed. Falling back to heuristics…")
+    
+    # 3. Final fallback → Enhanced heuristics / helper text
+    execution_time = time.time() - start_time
+    tracker.log_query(query, "COMPLEX", "fallback", False, execution_time)
+    return enhanced_fallback_analysis(df, query, schema), "fallback"
+
+def execute_hybrid_strategy(query: str, df: pd.DataFrame, schema: Dict, ollama_llm, gemini_llm) -> str:
+    """Main router with schema-aware execution"""
+    complexity = classify_query_complexity(query, schema)
+    st.info(f"🎯 Query classified as **{complexity}** | Schema-aware routing")
+    
+    if complexity == "SIMPLE":
+        st.info("⚡ Route: Heuristics → Pandas → Ollama")
+        result, path = execute_simple_strategy(query, df, schema, ollama_llm)
+    elif complexity == "MEDIUM":
+        st.info("🔄 Route: Ollama → Pandas Agent → Gemini")
+        result, path = execute_medium_strategy(query, df, schema, ollama_llm, gemini_llm)
+    else:  # COMPLEX
+        st.info("💎 Route: Gemini → Pandas Agent → Enhanced fallbacks")
+        result, path = execute_complex_strategy(query, df, schema, gemini_llm)
+    
+    # Add execution path info to result
+    path_emoji = {
+        "heuristic": "⚡", "pandas_direct": "🐼", "ollama": "🦙", 
+        "gemini": "💎", "fallback": "🔧", "pandas-agent": "🐼"
+    }
+    
+    return f"{result}\n\n---\n*Executed via: {path_emoji.get(path, '❓')} {path.upper()}*"
+
+# ---------- UI ----------
+
+st.title("🤖 OmniCore — Schema-Aware Hybrid AI Agents")
+st.caption("Dynamic schema detection • Smart heuristics • Multi-layer fallbacks • Audit tracking")
+
+# Initialize LLMs once
 ollama_llm, gemini_llm = initialize_llms()
 
-# Display LLM status
-col1, col2 = st.columns(2)
-with col1:
-    if ollama_llm:
-        st.success("🦙 **Ollama Ready** - Fast Local Analysis")
+# Load and analyze data schema
+df, data_err = load_sales_data(DATA_PATH)
+schema: Dict = {}
+
+if not data_err and df is not None:
+    # Detect schema using LLM
+    with st.spinner("🔍 Detecting dataset schema..."):
+        schema = schema_manager.detect_schema_with_llm(df, ollama_llm, gemini_llm)
+
+# Sidebar with enhanced status and analytics
+with st.sidebar:
+    st.subheader("🔧 System Status")
+
+    # Data & Schema status
+    if data_err:
+        st.error(f"❌ {data_err}")
     else:
-        st.error("❌ **Ollama Unavailable**")
+        st.success("✅ sales_data.csv ready")
+        if df is not None:
+            st.write(f"📊 {df.shape[0]} rows × {df.shape[1]} cols")
+            
+            # Schema insights
+            if schema:
+                st.success("🧠 Schema detected via LLM")
+                with st.expander("📋 Schema Details"):
+                    st.write(f"**Business Metrics:** {', '.join(schema.get('business_metrics', [])[:5]) or 'N/A'}")
+                    st.write(f"**Grouping Columns:** {', '.join(schema.get('groupby_candidates', [])[:8]) or 'N/A'}")
+                    st.write(f"**Date Columns:** {', '.join(schema.get('date_columns', []) or []) or 'N/A'}")
+                    st.write(f"**Insights:** {schema.get('schema_insights', 'N/A')}")
+            else:
+                st.warning("⚠️ Schema detection failed (using rule-based defaults)")
+
+    # LLMs status
+    st.markdown("### 🤖 AI Models")
+    st.success("🦙 Ollama Ready") if ollama_llm else st.error("❌ Ollama Unavailable")
+    st.success("💎 Gemini Ready") if gemini_llm else st.warning("⚠️ Gemini not configured")
+
+    # Knowledge Base
+    st.markdown("### 📚 Knowledge Base")
+    st.success("✅ Chroma Ready") if get_vector_store() else st.info("ℹ️ No KB")
+
+    # Query Analytics
+    st.markdown("### 📈 Query Analytics")
+    stats = tracker.get_stats()
+    if stats['total_queries'] > 0:
+        st.metric("Total Queries", stats['total_queries'])
         
-with col2:
-    if gemini_llm:
-        st.success("💎 **Gemini Ready** - Advanced AI Analysis") 
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("⚡ Heuristics", stats['heuristic_hits'])
+            st.metric("🦙 Ollama", stats['ollama_calls'])
+        with col2:
+            st.metric("💎 Gemini", stats['gemini_calls']) 
+            st.metric("🔧 Fallbacks", stats['fallback_hits'])
+        
+        st.metric("🐼 Pandas (Direct)", stats['pandas_direct'])
+        st.metric("🐼 Pandas (Agent)", stats['pandas_agent'])
+        
+        # Efficiency metrics
+        heuristic_rate = (stats['heuristic_hits'] / stats['total_queries']) * 100
+        st.metric("Efficiency", f"{heuristic_rate:.1f}%", help="% queries handled by fast heuristics")
     else:
-        st.warning("⚠️ **Gemini Unavailable** - Set API key")
+        st.info("No queries yet")
+    
+    # Performance tips
+    st.markdown("---")
+    st.markdown("### ⚡ Optimization Tips")
+    st.write("- Schema auto-detected for smart routing")
+    st.write("- Heuristics handle common queries instantly")
+    st.write("- Multi-layer fallbacks ensure reliability")
 
-# Strategy explanation
-with st.expander("🎯 How Hybrid Strategy Works"):
-    st.markdown("""
-    **🚀 Query Classification:**
-    - **BASIC** → 🦙 Ollama (Fast, Local): Simple data operations
-    - **MODERATE** → 🔄 Hybrid: Try Ollama first, fallback to Gemini  
-    - **COMPLEX** → 💎 Gemini (Advanced): Deep analysis, insights, trends
-    
-    **✅ Benefits:**
-    - ⚡ Faster responses for simple queries
-    - 🧠 Advanced AI for complex analysis  
-    - 💰 Cost optimization (less API usage)
-    - 🔄 Reliable fallbacks
-    """)
+# Main interface
+if data_err:
+    st.error(f"❌ {data_err}")
+else:
+    # Data preview with schema
+    with st.expander("📊 Dataset Overview", expanded=False):
+        if df is not None:
+            col1, col2 = st.columns([1, 1])
+            
+            with col1:
+                st.subheader("📋 Schema Analysis")
+                if schema:
+                    st.write("**🎯 Business Focus:**")
+                    st.write(schema.get('schema_insights', 'Standard dataset'))
+                    
+                    if schema.get('business_metrics'):
+                        st.write("**💰 Key Metrics:**")
+                        for metric in schema['business_metrics'][:5]:
+                            st.write(f"• {metric}")
+                    
+                    if schema.get('groupby_candidates'):
+                        st.write("**📊 Dimensions:**")
+                        for dim in schema['groupby_candidates'][:8]:
+                            st.write(f"• {dim}")
+                else:
+                    st.warning("Schema detection failed")
+            
+            with col2:
+                st.subheader("📄 Sample Data")
+                st.dataframe(df.head(8), use_container_width=True)
 
-# Example queries
-with st.expander("💡 Example Queries by Complexity"):
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
+    # Enhanced routing explanation
+    with st.expander("🎯 Smart Routing System"):
         st.markdown("""
-        **🦙 BASIC (Ollama)**
-        - `Show first 5 rows`
-        - `What columns exist?`
-        - `Describe the data`
-        - `Dataset shape`
-        """)
-    
-    with col2:
-        st.markdown("""
-        **🔄 MODERATE (Hybrid)**
-        - `Total sales`
-        - `Average by region`
-        - `Sales on 2023-01-02`
-        - `Product with sales 100`
-        """)
-    
-    with col3:
-        st.markdown("""
-        **💎 COMPLEX (Gemini)**
-        - `Analyze sales trends`
-        - `Find patterns and insights`
-        - `Recommendations for optimization`
-        - `Correlations and predictions`
+**🧠 Schema-Aware Classification:**
+- **SIMPLE** → ⚡ Heuristics (instant) → 🐼 Pandas → 🦙 Ollama  
+- **MEDIUM** → 🦙 Ollama (local) → 🐼 Pandas Agent → 💎 Gemini  
+- **COMPLEX** → 💎 Gemini (cloud) → 🐼 Pandas Agent → Enhanced fallbacks
+
+**🔄 Multi-Layer Fallbacks:**
+1. Fast heuristics using detected schema  
+2. Direct pandas operations  
+3. Local LLM processing (Ollama)  
+4. Cloud LLM reasoning (Gemini)  
+5. Enhanced rule-based analysis
+
+**📊 Schema-Driven Optimization:**
+- Auto-detects business metrics, dimensions, date columns  
+- Routes queries to optimal execution layer  
+- Tracks performance for continuous improvement
         """)
 
-# Main query input
+    # Dynamic examples based on detected schema
+    with st.expander("💡 Schema-Optimized Query Examples"):
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.markdown("**⚡ SIMPLE (Heuristics)**")
+            examples = ["Show first 10 rows", "Dataset shape", "Column information", "describe"]
+            if schema.get('business_metrics'):
+                examples.append(f"Total {schema['business_metrics'][0]}")
+            if schema.get('groupby_candidates'):
+                examples.append(f"Top 5 {schema['groupby_candidates'][0]}")
+            for ex in examples:
+                st.write(f"• {ex}")
+        
+        with col2:
+            st.markdown("**🔄 MEDIUM (Ollama+)**") 
+            examples = []
+            if schema.get('business_metrics') and schema.get('groupby_candidates'):
+                metric = schema['business_metrics'][0]
+                dimension = schema['groupby_candidates'][0]
+                examples = [
+                    f"Average {metric} by {dimension}",
+                    f"Top 10 {dimension} by {metric}",
+                    f"{metric} analysis by category"
+                ]
+            examples.extend(["Filter data by condition", "Monthly trends"])
+            for ex in examples[:6]:
+                st.write(f"• {ex}")
+        
+        with col3:
+            st.markdown("**💎 COMPLEX (Gemini)**")
+            examples = ["Analyze trends and patterns", "Correlations and insights"]
+            if schema.get('primary_business_entities') and len(schema['primary_business_entities']) > 1:
+                entities = schema['primary_business_entities'][:2]
+                examples.extend([f"Compare {entities[0]} vs {entities[1]}", f"Predict {entities[0]} performance"])
+            examples.extend(["Business recommendations", "What-if scenarios"])
+            for ex in examples[:6]:
+                st.write(f"• {ex}")
+
+# Query input with enhanced help
 query = st.text_input(
-    "🗣️ **Ask your question:**",
-    placeholder="e.g., 'Analyze sales trends' or 'Show first 5 rows'",
-    help="System will automatically choose the best AI for your query"
+    "🗣️ Ask your question:",
+    placeholder="e.g., 'Analyze sales trends by region' or 'Show top 5 products'",
+    help="System will auto-detect complexity and route to optimal execution layer"
 )
 
-# Process query
+# Mode selection
+mode = st.radio(
+    "Choose source:",
+    options=["Auto (Smart Detection)", "Sales Data", "Knowledge Base"],
+    horizontal=True,
+    index=0,
+    help="Auto mode intelligently routes between data analysis and knowledge base"
+)
+
+# Query execution
 if query:
-    with st.spinner("🧠 Processing with hybrid AI strategy..."):
+    st.markdown("---")
+    with st.spinner("🧠 Processing with schema-aware routing..."):
         try:
-            response = run_agent(query)
-            
-            st.markdown("---")
-            st.markdown("### 📝 Analysis Results:")
-            
-            if len(response) > 1000:
-                st.text_area("Detailed Response:", response, height=400)
+            if mode == "Knowledge Base":
+                response = kb_search(query)
+            else:
+                # Smart routing logic
+                sales_keywords = [
+                    "sales", "revenue", "product", "region", "customer",
+                    "order", "data", "analyze", "total", "average", "trend",
+                    "price", "profit", "margin", "category", "month", "year"
+                ]
+                is_data_query = (mode == "Sales Data") or any(k in query.lower() for k in sales_keywords)
+                
+                if is_data_query and df is not None and schema:
+                    response = execute_hybrid_strategy(query, df, schema, ollama_llm, gemini_llm)
+                else:
+                    response = kb_search(query)
+
+            # Display results
+            st.subheader("📝 Analysis Results")
+            if isinstance(response, str) and len(response) > 1500:
+                st.text_area("Detailed Response:", response, height=500, help="Long response - scroll to see all content")
             else:
                 st.markdown(response)
-                
-        except Exception as e:
-            st.error(f"❌ Error: {str(e)}")
 
-# Enhanced sidebar
-with st.sidebar:
-    st.markdown("## 🔧 System Status")
-    
-    # Data status
-    if os.path.exists("data/sales_data.csv"):
-        st.success("✅ **Data File Ready**")
-        try:
-            df = pd.read_csv("data/sales_data.csv")
-            st.write(f"📊 **{df.shape[0]}** rows × **{df.shape[1]}** columns")
-            st.caption(f"Columns: {', '.join(df.columns.tolist())}")
-        except:
-            st.warning("⚠️ Data file issues")
-    else:
-        st.error("❌ **sales_data.csv missing**")
-    
-    # LLM status
-    st.markdown("### 🤖 AI Models")
-    if ollama_llm:
-        st.success("🦙 Ollama Active")
-    else:
-        st.error("❌ Ollama Offline")
-        
-    if gemini_llm:
-        st.success("💎 Gemini Active")
-    else:
-        st.warning("⚠️ Gemini API Key Needed")
-    
-    # Knowledge base
-    if os.path.exists("./chroma_db"):
-        st.success("✅ Knowledge Base Ready")
-    else:
-        st.info("ℹ️ No Knowledge Base")
-    
-    st.markdown("---")
-    st.markdown("### ⚡ Performance Tips")
-    st.markdown("""
-    - Use specific keywords for better routing
-    - Basic queries are fastest with Ollama
-    - Complex analysis uses advanced Gemini AI
-    - System auto-selects optimal model
-    """)
+        except Exception as e:
+            st.error(f"❌ Error during processing: {stringify_exception(e)}")
+            tracker.log_query(query, "ERROR", "error", False, 0)
+
+# Query history and audit (optional)
+if st.sidebar.button("📊 Show Query Audit"):
+    with st.expander("📈 Query Performance Audit", expanded=True):
+        stats = tracker.get_stats()
+        if stats['audit_logs']:
+            # Recent queries
+            st.subheader("🕐 Recent Queries")
+            recent_logs = stats['audit_logs'][-10:]  # Last 10 queries
+            for log in reversed(recent_logs):
+                success_icon = "✅" if log['success'] else "❌"
+                path_icon = {
+                    "heuristic": "⚡", "ollama": "🦙", "gemini": "💎",
+                    "fallback": "🔧", "pandas_direct": "🐼", "pandas-agent": "🐼"
+                }.get(log['execution_path'], "❓")
+                
+                st.write(f"{success_icon} {path_icon} **{log['complexity']}** | {log['response_time_ms']:.0f}ms")
+                st.caption(f"Query: {log['query'][:160]}{'...' if len(log['query'])>160 else ''}")
+                st.caption(f"Path: {log['execution_path']} | Time: {log['timestamp']}")
+                st.divider()
+        else:
+            st.info("No queries logged yet")
+
+# Footer with system info
+st.markdown("---")
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    st.caption("🤖 **OmniCore v2.0**")
+    st.caption("Schema-aware hybrid routing")
+
+with col2:
+    if 'df' in locals() and df is not None:
+        st.caption(f"📊 **Dataset:** {df.shape[0]}×{df.shape[1]}")
+    st.caption("🧠 Dynamic LLM selection")
+
+with col3:
+    stats = tracker.get_stats()
+    st.caption(f"📈 **Queries:** {stats['total_queries']}")
+    if stats['total_queries'] > 0:
+        efficiency = (stats['heuristic_hits'] / stats['total_queries']) * 100
+        st.caption(f"⚡ **Efficiency:** {efficiency:.1f}%")

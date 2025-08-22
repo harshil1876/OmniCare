@@ -1,0 +1,4 @@
+{"timestamp": "2025-08-23T01:18:52.752981", "query": "What is the average sales?", "complexity": "MEDIUM", "execution_path": "ollama", "success": true, "response_time_ms": 23490.532159805298}
+{"timestamp": "2025-08-23T01:26:21.307171", "query": "What is the average sales?", "complexity": "COMPLEX", "execution_path": "fallback", "success": false, "response_time_ms": 2143.3560848236084}
+{"timestamp": "2025-08-23T01:36:32.532912", "query": "What is the average sales?", "complexity": "COMPLEX", "execution_path": "fallback", "success": false, "response_time_ms": 1892.096757888794}
+{"timestamp": "2025-08-23T01:53:29.283113", "query": "What is the average sales?", "complexity": "MEDIUM", "execution_path": "pandas-agent", "success": true, "response_time_ms": 42544.4917678833}
