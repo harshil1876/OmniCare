@@ -584,6 +584,11 @@ def classify_query_complexity(query: str, schema: Dict) -> str:
     business_entities = schema.get('primary_business_entities', []) or []
     business_metrics = schema.get('business_metrics', []) or []
     
+    # Chart/visualization queries are ALWAYS complex (routed to Gemini)
+    chart_keywords = ['chart', 'plot', 'graph', 'visuali', 'pie', 'bar', 'histogram', 'scatter', 'line chart']
+    if any(keyword in q for keyword in chart_keywords):
+        return "COMPLEX"
+    
     basic_indicators = [
         "head", "first", "show", "display", "columns", "shape", "size",
         "describe", "info", "summary", "list", "what are", "how many",
@@ -626,7 +631,12 @@ def classify_query_complexity(query: str, schema: Dict) -> str:
     return "SIMPLE"
 
 def preprocess_query_for_llm(query: str, df: pd.DataFrame, llm_type: str, schema: Dict) -> str:
-    """Enhanced preprocessing with schema context"""
+    """Enhanced preprocessing with schema context and chart handling"""
+    q = query.lower()
+    
+    # Check if this is a chart query
+    chart_keywords = ['chart', 'plot', 'graph', 'visuali', 'pie', 'bar', 'histogram', 'scatter', 'line chart']
+    is_chart_query = any(keyword in q for keyword in chart_keywords)
     
     if llm_type == "OLLAMA":
         schema_context = f"""
@@ -649,7 +659,36 @@ Provide a clear, concise answer. Use the python_repl_ast tool to analyze the dat
         head_sample = df.head(2).to_string(index=False, max_cols=8)
         schema_insights = schema.get('schema_insights', 'Business dataset')
         
+        # Add chart-specific instructions for Gemini
+        chart_instructions = ""
+        if is_chart_query:
+            chart_instructions = """
+CHART CREATION INSTRUCTIONS:
+- You are working in Streamlit environment
+- NEVER use plt.show() - it will not work
+- Instead use st.pyplot(plt.gcf()) to display charts
+- Always import streamlit as st
+- Use plt.figure(figsize=(width, height)) for proper sizing
+- Add proper titles, labels, and formatting
+- Call plt.close() after st.pyplot() to prevent memory issues
+
+Example pattern:
+```python
+import matplotlib.pyplot as plt
+import streamlit as st
+plt.figure(figsize=(10, 6))
+# your plotting code here
+plt.title('Chart Title')
+plt.xlabel('X Label')
+plt.ylabel('Y Label')
+st.pyplot(plt.gcf())
+plt.close()
+```
+"""
+        
         return f"""You are a senior data analyst. Provide comprehensive analysis for this question.
+
+{chart_instructions}
 
 Dataset Context: {schema_insights}
 - Shape: {df.shape[0]} rows × {df.shape[1]} columns
