@@ -2,3 +2,6 @@
 {"timestamp": "2025-08-23T01:26:21.307171", "query": "What is the average sales?", "complexity": "COMPLEX", "execution_path": "fallback", "success": false, "response_time_ms": 2143.3560848236084}
 {"timestamp": "2025-08-23T01:36:32.532912", "query": "What is the average sales?", "complexity": "COMPLEX", "execution_path": "fallback", "success": false, "response_time_ms": 1892.096757888794}
 {"timestamp": "2025-08-23T01:53:29.283113", "query": "What is the average sales?", "complexity": "MEDIUM", "execution_path": "pandas-agent", "success": true, "response_time_ms": 42544.4917678833}
+{"timestamp": "2025-08-25T19:40:24.810104", "query": "Average sales by date", "complexity": "MEDIUM", "execution_path": "ollama", "success": true, "response_time_ms": 75670.52412033081}
+{"timestamp": "2025-08-25T19:45:08.123379", "query": "Give a whole bar chart showing proper analysis.", "complexity": "SIMPLE", "execution_path": "ollama", "success": true, "response_time_ms": 107477.5390625}
+{"timestamp": "2025-08-25T19:48:06.690090", "query": "Give a proper business analysis from the chart with key insights.", "complexity": "COMPLEX", "execution_path": "pandas-agent", "success": true, "response_time_ms": 14615.622520446777}

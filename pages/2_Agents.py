@@ -48,6 +48,9 @@ def safe_extract_output(res) -> str:
         # langchain agents often put final text under 'output' or 'output_text'
         if "output_text" in res and isinstance(res["output_text"], str):
             return res["output_text"]
+        # Handle langchain agent response structure
+        if "result" in res and isinstance(res["result"], str):
+            return res["result"]
         # Fallback to stringify dict
         return json.dumps(res, ensure_ascii=False)
     # Fallback to str
@@ -151,7 +154,11 @@ Please return ONLY a valid JSON with this structure:
     "schema_insights": "Brief description of what this dataset represents"
 }}"""
         try:
-            response = llm.invoke(schema_prompt)
+            if gemini_llm:
+                response = gemini_llm.invoke(schema_prompt)
+            else:
+                response = ollama_llm.invoke(schema_prompt)
+            
             response_text = safe_extract_output(response)
             json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
             if json_match:
@@ -474,14 +481,18 @@ def initialize_llms():
     # Ollama
     try:
         ollama_llm = OllamaLLM(
-            model="llama2:latest",
+            model="llama3.1",
             temperature=0,
-            num_predict=200,
+            num_predict=500,  # Increased from 200 for fuller responses
             top_p=0.9,
             repeat_penalty=1.1,
-            num_ctx=1024,
+            num_ctx=4096,  # Increased from 1024 for more context
             top_k=20,
         )
+        # Test connection
+        test_response = ollama_llm.invoke("Hello, respond with 'Ollama working'")
+        if "working" not in str(test_response).lower():
+            st.warning("⚠️ Ollama test response unexpected - may have connection issues")
     except Exception as e:
         st.warning(f"⚠️ Ollama initialization failed: {stringify_exception(e)}")
 
@@ -490,11 +501,15 @@ def initialize_llms():
         api_key = os.getenv("GEMINI_API_KEY")
         if api_key:
             gemini_llm = ChatGoogleGenerativeAI(
-                model="gemini-2.0-flash-exp",
+                model="gemini-2.0-flash-exp",  # Updated to available model
                 google_api_key=api_key,
                 temperature=0.1,
                 convert_system_message_to_human=True,
             )
+            # Test connection
+            test_response = gemini_llm.invoke("Hello, respond with 'Gemini working'")
+            if "working" not in str(test_response).lower():
+                st.warning("⚠️ Gemini test response unexpected - may have connection issues")
         else:
             st.warning("⚠️ GEMINI_API_KEY missing in .env")
     except Exception as e:
@@ -530,11 +545,12 @@ def create_ollama_agent(df: pd.DataFrame, ollama_llm: OllamaLLM):
         return create_pandas_dataframe_agent(
             llm=ollama_llm,
             df=df,
-            verbose=False,
+            verbose=True,  # Changed to True for debugging
             allow_dangerous_code=True,
             handle_parsing_errors=True,
-            max_iterations=100,
+            max_iterations=100,  # Reduced from 100 to prevent long waits
             agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+            return_intermediate_steps=False,
         )
     except Exception as e:
         st.warning(f"Ollama agent creation failed: {stringify_exception(e)}")
@@ -547,11 +563,12 @@ def create_gemini_agent(df: pd.DataFrame, gemini_llm: ChatGoogleGenerativeAI):
         return create_pandas_dataframe_agent(
             llm=gemini_llm,
             df=df,
-            verbose=False,
+            verbose=True,  # Changed to True for debugging
             allow_dangerous_code=True,
             handle_parsing_errors=True,
-            max_iterations=100,
+            max_iterations=100,  # Reduced from 100 to prevent long waits
             agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+            return_intermediate_steps=False,
         )
     except Exception as e:
         st.warning(f"Gemini agent creation failed: {stringify_exception(e)}")
@@ -618,20 +635,21 @@ Schema Info:
 - Group-by Columns: {schema.get('groupby_candidates', [])}
 - Date Columns: {schema.get('date_columns', [])}
 """
-        return f"""You are a data assistant. Answer concisely using pandas.
+        return f"""You are a helpful data analyst. Answer the user's question about the dataset using python/pandas.
 
 {schema_context}
 Question: {query}
 
-DataFrame: {df.shape[0]} rows × {df.shape[1]} cols
+DataFrame info: {df.shape[0]} rows × {df.shape[1]} columns
 Columns: {list(df.columns)}
 
-Use python tool for pandas operations."""
+Provide a clear, concise answer. Use the python_repl_ast tool to analyze the data when needed."""
+
     elif llm_type == "GEMINI":
         head_sample = df.head(2).to_string(index=False, max_cols=8)
         schema_insights = schema.get('schema_insights', 'Business dataset')
         
-        return f"""You are a senior data analyst. Provide comprehensive analysis.
+        return f"""You are a senior data analyst. Provide comprehensive analysis for this question.
 
 Dataset Context: {schema_insights}
 - Shape: {df.shape[0]} rows × {df.shape[1]} columns
@@ -644,12 +662,12 @@ Sample Data:
 
 Question: {query}
 
-Provide:
-1. Direct answer with specific numbers
-2. Business insights and patterns
-3. Actionable recommendations (if applicable)
+Please provide:
+1. Direct answer with specific numbers/insights
+2. Business context and interpretation
+3. Any actionable recommendations (if applicable)
 
-Use python tool for complex pandas operations."""
+Use the python_repl_ast tool for complex pandas operations."""
     return query
 
 # ---------- Pandas helpers ----------
@@ -680,18 +698,35 @@ def run_pandas_agent(query: str, df: pd.DataFrame, gemini_llm=None, ollama_llm=N
     Prefers Gemini if available, otherwise Ollama.
     """
     agent = None
+    agent_type = None
+    
     try:
         if gemini_llm:
             agent = create_gemini_agent(df, gemini_llm)
+            agent_type = "Gemini"
         if not agent and ollama_llm:
             agent = create_ollama_agent(df, ollama_llm)
+            agent_type = "Ollama"
         if not agent:
             st.warning("No LLM available for Pandas agent.")
             return None
-        res = agent.invoke({"input": query})
-        return safe_extract_output(res)
+        
+        st.info(f"🤖 Using {agent_type} Pandas Agent...")
+        
+        # Execute with timeout protection
+        with st.spinner(f"🧠 {agent_type} processing..."):
+            res = agent.invoke({"input": query})
+            output = safe_extract_output(res)
+            
+            # Validate output quality
+            if output and len(output.strip()) > 10:
+                return output
+            else:
+                st.warning(f"{agent_type} agent returned minimal output: {output}")
+                return None
+                
     except Exception as e:
-        st.warning(f"Pandas agent failed: {stringify_exception(e)}")
+        st.warning(f"Pandas agent ({agent_type}) failed: {stringify_exception(e)}")
         return None
 
 # ---------- Knowledge Base search ----------
@@ -786,18 +821,18 @@ def execute_simple_strategy(query: str, df: pd.DataFrame, schema: Dict, ollama_l
     
     # 3. Fallback to Ollama agent (fast local)
     if ollama_llm:
-        agent = create_ollama_agent(df, ollama_llm)
-        if agent:
-            try:
-                prompt = preprocess_query_for_llm(query, df, "OLLAMA", schema)
+        try:
+            prompt = preprocess_query_for_llm(query, df, "OLLAMA", schema)
+            agent = create_ollama_agent(df, ollama_llm)
+            if agent:
                 res = agent.invoke({"input": prompt})
                 output = safe_extract_output(res)
-                if output.strip():
+                if output.strip() and len(output) > 20:
                     execution_time = time.time() - start_time
                     tracker.log_query(query, "SIMPLE", "ollama", True, execution_time)
                     return f"🦙 **Ollama Analysis:**\n\n{output}", "ollama"
-            except Exception as e:
-                st.warning(f"Ollama failed: {stringify_exception(e)}")
+        except Exception as e:
+            st.warning(f"Ollama failed: {stringify_exception(e)}")
     
     # 4. Final fallback
     execution_time = time.time() - start_time
@@ -810,32 +845,37 @@ def execute_medium_strategy(query: str, df: pd.DataFrame, schema: Dict, ollama_l
     
     # 1. Try Ollama first (local, fast)
     if ollama_llm:
-        agent = create_ollama_agent(df, ollama_llm)
-        if agent:
-            try:
-                prompt = preprocess_query_for_llm(query, df, "OLLAMA", schema)
+        try:
+            prompt = preprocess_query_for_llm(query, df, "OLLAMA", schema)
+            agent = create_ollama_agent(df, ollama_llm)
+            if agent:
                 res = agent.invoke({"input": prompt})
                 output = safe_extract_output(res)
-                if output.strip() and len(output) > 50 and "error" not in output.lower():
+                # Better validation for meaningful responses
+                if (output.strip() and 
+                    len(output) > 50 and 
+                    not any(err in output.lower() for err in ["error", "failed", "cannot", "unable"]) and
+                    any(word in output.lower() for word in ["data", "analysis", "result", "show", "total", "average"])):
+                    
                     execution_time = time.time() - start_time
                     tracker.log_query(query, "MEDIUM", "ollama", True, execution_time)
                     return f"🦙 **Ollama Analysis:**\n\n{output}", "ollama"
                 else:
-                    st.info("⚠️ Ollama returned a weak/empty response → Trying Pandas Agent…")
-            except Exception:
-                st.info("⚠️ Ollama failed → Trying Pandas Agent…")
+                    st.info("⚠️ Ollama returned weak response → Trying Pandas Agent…")
+        except Exception as e:
+            st.info(f"⚠️ Ollama failed ({stringify_exception(e)}) → Trying Pandas Agent…")
 
     # 2. Fallback → Pandas Agent
     try:
         pandas_res = run_pandas_agent(query, df, gemini_llm=gemini_llm, ollama_llm=ollama_llm)
-        if pandas_res and isinstance(pandas_res, str) and len(pandas_res.strip()) > 10:
+        if pandas_res and len(pandas_res.strip()) > 20:
             execution_time = time.time() - start_time
             tracker.log_query(query, "MEDIUM", "pandas-agent", True, execution_time)
             return f"🐼 **Pandas Agent Analysis:**\n\n{pandas_res}", "pandas-agent"
         else:
-            st.info("⚠️ Pandas Agent returned nothing useful → Trying Gemini…")
-    except Exception:
-        st.info("⚠️ Pandas Agent failed → Trying Gemini…")
+            st.info("⚠️ Pandas Agent returned minimal output → Trying Gemini…")
+    except Exception as e:
+        st.info(f"⚠️ Pandas Agent failed ({stringify_exception(e)}) → Trying Gemini…")
 
     # 3. Final fallback → Gemini (delegates to complex path)
     return execute_complex_strategy(query, df, schema, gemini_llm)
@@ -846,31 +886,37 @@ def execute_complex_strategy(query: str, df: pd.DataFrame, schema: Dict, gemini_
     
     # 1. Try Gemini for advanced reasoning
     if gemini_llm:
-        agent = create_gemini_agent(df, gemini_llm)
-        if agent:
-            try:
-                prompt = preprocess_query_for_llm(query, df, "GEMINI", schema)
+        try:
+            prompt = preprocess_query_for_llm(query, df, "GEMINI", schema)
+            agent = create_gemini_agent(df, gemini_llm)
+            if agent:
                 with st.spinner("🧠 Gemini analyzing..."):
                     res = agent.invoke({"input": prompt})
                 output = safe_extract_output(res)
-                if output.strip():
+                
+                # Better validation for Gemini responses
+                if (output.strip() and 
+                    len(output) > 30 and
+                    not output.lower().startswith("i cannot") and
+                    not output.lower().startswith("i'm sorry")):
+                    
                     execution_time = time.time() - start_time
                     tracker.log_query(query, "COMPLEX", "gemini", True, execution_time)
                     return f"💎 **Gemini Advanced Analysis:**\n\n{output}", "gemini"
                 else:
-                    st.info("⚠️ Gemini returned an empty response → Trying Pandas Agent…")
-            except Exception as e:
-                st.warning(f"Gemini API failed: {stringify_exception(e)}")
+                    st.info("⚠️ Gemini returned minimal response → Trying Pandas Agent…")
+        except Exception as e:
+            st.warning(f"Gemini API failed: {stringify_exception(e)}")
 
-    # 2. Fallback → Pandas Agent (LLM-agnostic: Gemini if available else Ollama)
+    # 2. Fallback → Pandas Agent (Gemini preference, then Ollama)
     try:
         pandas_res = run_pandas_agent(query, df, gemini_llm=gemini_llm, ollama_llm=None)
-        if pandas_res and isinstance(pandas_res, str) and len(pandas_res.strip()) > 10:
+        if pandas_res and len(pandas_res.strip()) > 20:
             execution_time = time.time() - start_time
             tracker.log_query(query, "COMPLEX", "pandas-agent", True, execution_time)
             return f"🐼 **Pandas Agent (Complex Fallback):**\n\n{pandas_res}", "pandas-agent"
     except Exception:
-        st.info("⚠️ Pandas Agent also failed. Falling back to heuristics…")
+        st.info("⚠️ Pandas Agent also failed. Using enhanced fallback…")
     
     # 3. Final fallback → Enhanced heuristics / helper text
     execution_time = time.time() - start_time
@@ -942,12 +988,26 @@ with st.sidebar:
 
     # LLMs status
     st.markdown("### 🤖 AI Models")
-    st.success("🦙 Ollama Ready") if ollama_llm else st.error("❌ Ollama Unavailable")
-    st.success("💎 Gemini Ready") if gemini_llm else st.warning("⚠️ Gemini not configured")
+    if ollama_llm:
+        st.success("🦙 Ollama Ready")
+        st.caption("Local • Fast • Private")
+    else:
+        st.error("❌ Ollama Unavailable")
+        st.caption("Check if Ollama service is running")
+    
+    if gemini_llm:
+        st.success("💎 Gemini Ready")
+        st.caption("Cloud • Advanced • Powerful")
+    else:
+        st.warning("⚠️ Gemini not configured")
+        st.caption("Add GEMINI_API_KEY to .env")
 
     # Knowledge Base
     st.markdown("### 📚 Knowledge Base")
-    st.success("✅ Chroma Ready") if get_vector_store() else st.info("ℹ️ No KB")
+    if get_vector_store():
+        st.success("✅ Chroma Ready")
+    else:
+        st.info("ℹ️ No KB found")
 
     # Query Analytics
     st.markdown("### 📈 Query Analytics")
@@ -969,6 +1029,14 @@ with st.sidebar:
         # Efficiency metrics
         heuristic_rate = (stats['heuristic_hits'] / stats['total_queries']) * 100
         st.metric("Efficiency", f"{heuristic_rate:.1f}%", help="% queries handled by fast heuristics")
+        
+        # Success rate
+        successful_queries = sum([
+            stats['heuristic_hits'], stats['ollama_calls'], 
+            stats['gemini_calls'], stats['pandas_direct'], stats['pandas_agent']
+        ])
+        success_rate = (successful_queries / stats['total_queries']) * 100
+        st.metric("Success Rate", f"{success_rate:.1f}%", help="% queries with meaningful responses")
     else:
         st.info("No queries yet")
     
@@ -982,6 +1050,12 @@ with st.sidebar:
 # Main interface
 if data_err:
     st.error(f"❌ {data_err}")
+    st.info("""
+    **Quick Fix:**
+    1. Create a `data/` folder in your project
+    2. Place your CSV file as `sales_data.csv`
+    3. Or update the `DATA_PATH` variable in the code
+    """)
 else:
     # Data preview with schema
     with st.expander("📊 Dataset Overview", expanded=False):
