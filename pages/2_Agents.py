@@ -757,6 +757,10 @@ def run_pandas_agent(query: str, df: pd.DataFrame, gemini_llm=None, ollama_llm=N
             res = agent.invoke({"input": query})
             output = safe_extract_output(res)
             
+            # Clean response if it came from Gemini
+            if agent_type == "Gemini":
+                output = clean_gemini_response(output)
+            
             # Validate output quality
             if output and len(output.strip()) > 10:
                 return output
@@ -933,6 +937,9 @@ def execute_complex_strategy(query: str, df: pd.DataFrame, schema: Dict, gemini_
                     res = agent.invoke({"input": prompt})
                 output = safe_extract_output(res)
                 
+                # Clean the Gemini response
+                output = clean_gemini_response(output)
+                
                 # Better validation for Gemini responses
                 if (output.strip() and 
                     len(output) > 30 and
@@ -941,7 +948,7 @@ def execute_complex_strategy(query: str, df: pd.DataFrame, schema: Dict, gemini_
                     
                     execution_time = time.time() - start_time
                     tracker.log_query(query, "COMPLEX", "gemini", True, execution_time)
-                    return f"💎 **Gemini Advanced Analysis:**\n\n{output}", "gemini"
+                    return f"💎 Gemini Advanced Analysis:\n\n{output}", "gemini"
                 else:
                     st.info("⚠️ Gemini returned minimal response → Trying Pandas Agent…")
         except Exception as e:
@@ -951,9 +958,11 @@ def execute_complex_strategy(query: str, df: pd.DataFrame, schema: Dict, gemini_
     try:
         pandas_res = run_pandas_agent(query, df, gemini_llm=gemini_llm, ollama_llm=None)
         if pandas_res and len(pandas_res.strip()) > 20:
+            # Clean pandas agent response too (in case it's also from Gemini)
+            pandas_res = clean_gemini_response(pandas_res)
             execution_time = time.time() - start_time
             tracker.log_query(query, "COMPLEX", "pandas-agent", True, execution_time)
-            return f"🐼 **Pandas Agent (Complex Fallback):**\n\n{pandas_res}", "pandas-agent"
+            return f"🐼 Pandas Agent (Complex Fallback):\n\n{pandas_res}", "pandas-agent"
     except Exception:
         st.info("⚠️ Pandas Agent also failed. Using enhanced fallback…")
     
@@ -984,6 +993,28 @@ def execute_hybrid_strategy(query: str, df: pd.DataFrame, schema: Dict, ollama_l
     }
     
     return f"{result}\n\n---\n*Executed via: {path_emoji.get(path, '❓')} {path.upper()}*"
+
+# ---------- Gemini Response Cleaning ----------
+def clean_gemini_response(response_text: str) -> str:
+    """Clean up Gemini response by removing excessive markdown formatting"""
+    if not response_text:
+        return response_text
+    
+    # Remove double asterisks (bold markdown)
+    cleaned = response_text.replace('**', '')
+    
+    # Remove single asterisks at word boundaries (italic markdown)
+    import re
+    cleaned = re.sub(r'\*(\w[^*]*\w)\*', r'\1', cleaned)
+    
+    # Remove triple backticks and language specifiers
+    cleaned = re.sub(r'```\w*\n', '', cleaned)
+    cleaned = cleaned.replace('```', '')
+    
+    # Clean up excessive newlines
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    
+    return cleaned.strip()
 
 # ---------- UI ----------
 
