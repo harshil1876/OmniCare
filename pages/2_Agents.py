@@ -733,7 +733,7 @@ def try_direct_pandas_operations(query: str, df: pd.DataFrame) -> Optional[str]:
 
 def run_pandas_agent(query: str, df: pd.DataFrame, gemini_llm=None, ollama_llm=None) -> Optional[str]:
     """
-    Execute query using a Pandas agent.
+    Execute query using a Pandas agent with consistent response cleaning.
     Prefers Gemini if available, otherwise Ollama.
     """
     agent = None
@@ -750,10 +750,10 @@ def run_pandas_agent(query: str, df: pd.DataFrame, gemini_llm=None, ollama_llm=N
             st.warning("No LLM available for Pandas agent.")
             return None
         
-        st.info(f"🤖 Using {agent_type} Pandas Agent...")
+        st.info(f"Using {agent_type} Pandas Agent...")
         
         # Execute with timeout protection
-        with st.spinner(f"🧠 {agent_type} processing..."):
+        with st.spinner(f"{agent_type} processing..."):
             res = agent.invoke({"input": query})
             output = safe_extract_output(res)
             
@@ -771,6 +771,37 @@ def run_pandas_agent(query: str, df: pd.DataFrame, gemini_llm=None, ollama_llm=N
     except Exception as e:
         st.warning(f"Pandas agent ({agent_type}) failed: {stringify_exception(e)}")
         return None
+
+# ---------- Chart Validation Helper ----------
+
+def validate_chart_display() -> bool:
+    """Validate that chart was successfully created and displayed"""
+    try:
+        import matplotlib.pyplot as plt
+        # Check if there's an active figure
+        if plt.gcf().get_axes():
+            return True
+        return False
+    except Exception:
+        return False
+
+def safe_chart_display() -> str:
+    """Safely display chart with validation"""
+    try:
+        import matplotlib.pyplot as plt
+        if validate_chart_display():
+            st.pyplot(plt.gcf())
+            plt.close()
+            return "Chart displayed successfully."
+        else:
+            plt.close()  # Clean up even if no chart
+            return "No chart was generated."
+    except Exception as e:
+        try:
+            plt.close()  # Always try to clean up
+        except:
+            pass
+        return f"Chart display error: {stringify_exception(e)}"
 
 # ---------- Knowledge Base search ----------
 
@@ -883,7 +914,7 @@ def execute_simple_strategy(query: str, df: pd.DataFrame, schema: Dict, ollama_l
     return generate_helpful_response(df, query, schema), "fallback"
 
 def execute_medium_strategy(query: str, df: pd.DataFrame, schema: Dict, ollama_llm, gemini_llm) -> Tuple[str, str]:
-    """Medium queries: Ollama → Pandas Agent → Gemini (fallback)"""
+    """Medium queries: Ollama → Pandas Agent → Gemini (fallback) - NOW WITH CONSISTENT CLEANING"""
     start_time = time.time()
     
     # 1. Try Ollama first (local, fast)
@@ -902,11 +933,11 @@ def execute_medium_strategy(query: str, df: pd.DataFrame, schema: Dict, ollama_l
                     
                     execution_time = time.time() - start_time
                     tracker.log_query(query, "MEDIUM", "ollama", True, execution_time)
-                    return f"🦙 **Ollama Analysis:**\n\n{output}", "ollama"
+                    return f"Ollama Analysis:\n\n{output}", "ollama"
                 else:
-                    st.info("⚠️ Ollama returned weak response → Trying Pandas Agent…")
+                    st.info("Ollama returned weak response → Trying Pandas Agent…")
         except Exception as e:
-            st.info(f"⚠️ Ollama failed ({stringify_exception(e)}) → Trying Pandas Agent…")
+            st.info(f"Ollama failed ({stringify_exception(e)}) → Trying Pandas Agent…")
 
     # 2. Fallback → Pandas Agent
     try:
@@ -914,18 +945,47 @@ def execute_medium_strategy(query: str, df: pd.DataFrame, schema: Dict, ollama_l
         if pandas_res and len(pandas_res.strip()) > 20:
             execution_time = time.time() - start_time
             tracker.log_query(query, "MEDIUM", "pandas-agent", True, execution_time)
-            return f"🐼 **Pandas Agent Analysis:**\n\n{pandas_res}", "pandas-agent"
+            return f"Pandas Agent Analysis:\n\n{pandas_res}", "pandas-agent"
         else:
-            st.info("⚠️ Pandas Agent returned minimal output → Trying Gemini…")
+            st.info("Pandas Agent returned minimal output → Trying Gemini…")
     except Exception as e:
-        st.info(f"⚠️ Pandas Agent failed ({stringify_exception(e)}) → Trying Gemini…")
+        st.info(f"Pandas Agent failed ({stringify_exception(e)}) → Trying Gemini…")
 
-    # 3. Final fallback → Gemini (delegates to complex path)
-    return execute_complex_strategy(query, df, schema, gemini_llm)
+    # 3. Final fallback → Gemini (delegates to complex path) - WITH CLEANING
+    if gemini_llm:
+        try:
+            prompt = preprocess_query_for_llm(query, df, "GEMINI", schema)
+            agent = create_gemini_agent(df, gemini_llm)
+            if agent:
+                with st.spinner("Gemini analyzing..."):
+                    res = agent.invoke({"input": prompt})
+                output = safe_extract_output(res)
+                
+                # CLEAN GEMINI RESPONSE HERE TOO
+                output = clean_gemini_response(output)
+                
+                if output.strip() and len(output) > 30:
+                    execution_time = time.time() - start_time
+                    tracker.log_query(query, "MEDIUM", "gemini", True, execution_time)
+                    return f"Gemini Fallback Analysis:\n\n{output}", "gemini"
+        except Exception as e:
+            st.warning(f"Gemini fallback failed: {stringify_exception(e)}")
+    
+    # 4. Ultimate fallback
+    execution_time = time.time() - start_time
+    tracker.log_query(query, "MEDIUM", "fallback", False, execution_time)
+    return enhanced_fallback_analysis(df, query, schema), "fallback"
+
+# ---------- Updated Execute Complex Strategy (with chart validation) ----------
 
 def execute_complex_strategy(query: str, df: pd.DataFrame, schema: Dict, gemini_llm) -> Tuple[str, str]:
-    """Complex queries: Gemini → Pandas Agent (fallback) → Enhanced fallback"""
+    """Complex queries: Gemini → Pandas Agent (fallback) → Enhanced fallback - WITH CHART VALIDATION"""
     start_time = time.time()
+    
+    # Check if this is a chart query for additional validation
+    q = query.lower()
+    chart_keywords = ['chart', 'plot', 'graph', 'visuali', 'pie', 'bar', 'histogram', 'scatter', 'line chart']
+    is_chart_query = any(keyword in q for keyword in chart_keywords)
     
     # 1. Try Gemini for advanced reasoning
     if gemini_llm:
@@ -933,12 +993,20 @@ def execute_complex_strategy(query: str, df: pd.DataFrame, schema: Dict, gemini_
             prompt = preprocess_query_for_llm(query, df, "GEMINI", schema)
             agent = create_gemini_agent(df, gemini_llm)
             if agent:
-                with st.spinner("🧠 Gemini analyzing..."):
+                with st.spinner("Gemini analyzing..."):
                     res = agent.invoke({"input": prompt})
                 output = safe_extract_output(res)
                 
                 # Clean the Gemini response
                 output = clean_gemini_response(output)
+                
+                # For chart queries, add validation message
+                if is_chart_query:
+                    chart_status = safe_chart_display()
+                    if "successfully" in chart_status:
+                        output += f"\n\n---\n*{chart_status}*"
+                    else:
+                        output += f"\n\n---\n*⚠️ {chart_status}*"
                 
                 # Better validation for Gemini responses
                 if (output.strip() and 
@@ -948,9 +1016,9 @@ def execute_complex_strategy(query: str, df: pd.DataFrame, schema: Dict, gemini_
                     
                     execution_time = time.time() - start_time
                     tracker.log_query(query, "COMPLEX", "gemini", True, execution_time)
-                    return f"💎 Gemini Advanced Analysis:\n\n{output}", "gemini"
+                    return f"Gemini Advanced Analysis:\n\n{output}", "gemini"
                 else:
-                    st.info("⚠️ Gemini returned minimal response → Trying Pandas Agent…")
+                    st.info("Gemini returned minimal response → Trying Pandas Agent…")
         except Exception as e:
             st.warning(f"Gemini API failed: {stringify_exception(e)}")
 
@@ -960,16 +1028,23 @@ def execute_complex_strategy(query: str, df: pd.DataFrame, schema: Dict, gemini_
         if pandas_res and len(pandas_res.strip()) > 20:
             # Clean pandas agent response too (in case it's also from Gemini)
             pandas_res = clean_gemini_response(pandas_res)
+            
+            # Chart validation for pandas agent too
+            if is_chart_query:
+                chart_status = safe_chart_display()
+                pandas_res += f"\n\n---\n*{chart_status}*"
+            
             execution_time = time.time() - start_time
             tracker.log_query(query, "COMPLEX", "pandas-agent", True, execution_time)
-            return f"🐼 Pandas Agent (Complex Fallback):\n\n{pandas_res}", "pandas-agent"
+            return f"Pandas Agent (Complex Fallback):\n\n{pandas_res}", "pandas-agent"
     except Exception:
-        st.info("⚠️ Pandas Agent also failed. Using enhanced fallback…")
+        st.info("Pandas Agent also failed. Using enhanced fallback…")
     
     # 3. Final fallback → Enhanced heuristics / helper text
     execution_time = time.time() - start_time
     tracker.log_query(query, "COMPLEX", "fallback", False, execution_time)
     return enhanced_fallback_analysis(df, query, schema), "fallback"
+
 
 def execute_hybrid_strategy(query: str, df: pd.DataFrame, schema: Dict, ollama_llm, gemini_llm) -> str:
     """Main router with schema-aware execution"""
@@ -996,25 +1071,43 @@ def execute_hybrid_strategy(query: str, df: pd.DataFrame, schema: Dict, ollama_l
 
 # ---------- Gemini Response Cleaning ----------
 def clean_gemini_response(response_text: str) -> str:
-    """Clean up Gemini response by removing excessive markdown formatting"""
-    if not response_text:
+    """Clean up Gemini response by removing excessive markdown formatting with error handling"""
+    if not response_text or not isinstance(response_text, str):
+        return str(response_text) if response_text else ""
+    
+    try:
+        # Remove double asterisks (bold markdown)
+        cleaned = response_text.replace('**', '')
+        
+        # Remove single asterisks at word boundaries (italic markdown) with error handling
+        import re
+        try:
+            cleaned = re.sub(r'\*(\w[^*]*\w)\*', r'\1', cleaned)
+        except re.error:
+            # Fallback: simple replacement if regex fails
+            cleaned = cleaned.replace('*', '')
+        
+        # Remove triple backticks and language specifiers with error handling
+        try:
+            cleaned = re.sub(r'```\w*\n', '', cleaned)
+            cleaned = cleaned.replace('```', '')
+        except re.error:
+            # Fallback: simple replacement
+            cleaned = cleaned.replace('```', '')
+        
+        # Clean up excessive newlines with error handling
+        try:
+            cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+        except re.error:
+            # Fallback: leave as is if regex fails
+            pass
+        
+        return cleaned.strip()
+        
+    except Exception as e:
+        # If all cleaning fails, return original text
+        st.warning(f"Response cleaning failed: {stringify_exception(e)}")
         return response_text
-    
-    # Remove double asterisks (bold markdown)
-    cleaned = response_text.replace('**', '')
-    
-    # Remove single asterisks at word boundaries (italic markdown)
-    import re
-    cleaned = re.sub(r'\*(\w[^*]*\w)\*', r'\1', cleaned)
-    
-    # Remove triple backticks and language specifiers
-    cleaned = re.sub(r'```\w*\n', '', cleaned)
-    cleaned = cleaned.replace('```', '')
-    
-    # Clean up excessive newlines
-    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
-    
-    return cleaned.strip()
 
 # ---------- UI ----------
 
