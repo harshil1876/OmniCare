@@ -871,7 +871,7 @@ def generate_helpful_response(df: pd.DataFrame, query: str, schema: Dict) -> str
 """
 
 def execute_simple_strategy(query: str, df: pd.DataFrame, schema: Dict, ollama_llm) -> Tuple[str, str]:
-    """Simple queries: Heuristics → Pandas Direct → Ollama (fallback)"""
+    """Simple queries: Heuristics → Pandas Direct → Ollama (with proper agent checking)"""
     start_time = time.time()
     
     # 1. Try dynamic heuristics first
@@ -889,92 +889,94 @@ def execute_simple_strategy(query: str, df: pd.DataFrame, schema: Dict, ollama_l
         if result:
             execution_time = time.time() - start_time
             tracker.log_query(query, "SIMPLE", "pandas_direct", True, execution_time)
-            return f"🐼 **Direct Pandas Analysis:**\n\n{result}", "pandas_direct"
+            return f"Direct Pandas Analysis:\n\n{result}", "pandas_direct"
     except Exception:
         pass
     
-    # 3. Fallback to Ollama agent (fast local)
+    # 3. Try Ollama agent - CHECK IF AGENT IS ACTUALLY CREATED
     if ollama_llm:
         try:
-            prompt = preprocess_query_for_llm(query, df, "OLLAMA", schema)
             agent = create_ollama_agent(df, ollama_llm)
-            if agent:
-                res = agent.invoke({"input": prompt})
-                output = safe_extract_output(res)
-                if output.strip() and len(output) > 20:
-                    execution_time = time.time() - start_time
-                    tracker.log_query(query, "SIMPLE", "ollama", True, execution_time)
-                    return f"🦙 **Ollama Analysis:**\n\n{output}", "ollama"
+            if agent:  # Only proceed if agent was successfully created
+                simple_prompt = f"Analyze the data and answer: {query}"
+                try:
+                    res = agent.invoke({"input": simple_prompt})
+                    output = safe_extract_output(res)
+                    if output.strip() and len(output) > 20:
+                        execution_time = time.time() - start_time
+                        tracker.log_query(query, "SIMPLE", "ollama", True, execution_time)
+                        return f"Ollama Analysis:\n\n{output}", "ollama"
+                except (OutputParserException, ValueError) as e:
+                    st.info(f"Ollama parsing error: {stringify_exception(e)}")
+            else:
+                st.info("Ollama agent creation failed → Skipping to fallback")
         except Exception as e:
-            st.warning(f"Ollama failed: {stringify_exception(e)}")
+            st.info(f"Ollama failed: {stringify_exception(e)}")
     
     # 4. Final fallback
     execution_time = time.time() - start_time
     tracker.log_query(query, "SIMPLE", "fallback", False, execution_time)
     return generate_helpful_response(df, query, schema), "fallback"
 
+# ---------- Fixed Medium Strategy ----------
+
 def execute_medium_strategy(query: str, df: pd.DataFrame, schema: Dict, ollama_llm, gemini_llm) -> Tuple[str, str]:
-    """Medium queries: Ollama → Pandas Agent → Gemini (fallback) - NOW WITH CONSISTENT CLEANING"""
+    """Medium queries with proper agent validation"""
     start_time = time.time()
     
-    # 1. Try Ollama first (local, fast)
+    # 1. Try Ollama first - CHECK IF AGENT IS CREATED
     if ollama_llm:
         try:
-            prompt = preprocess_query_for_llm(query, df, "OLLAMA", schema)
             agent = create_ollama_agent(df, ollama_llm)
-            if agent:
-                res = agent.invoke({"input": prompt})
-                output = safe_extract_output(res)
-                # Better validation for meaningful responses
-                if (output.strip() and 
-                    len(output) > 50 and 
-                    not any(err in output.lower() for err in ["error", "failed", "cannot", "unable"]) and
-                    any(word in output.lower() for word in ["data", "analysis", "result", "show", "total", "average"])):
+            if agent:  # Only proceed if agent exists
+                simple_prompt = f"Using the dataframe 'df', {query}. Show the result."
+                try:
+                    res = agent.invoke({"input": simple_prompt})
+                    output = safe_extract_output(res)
                     
-                    execution_time = time.time() - start_time
-                    tracker.log_query(query, "MEDIUM", "ollama", True, execution_time)
-                    return f"Ollama Analysis:\n\n{output}", "ollama"
-                else:
-                    st.info("Ollama returned weak response → Trying Pandas Agent…")
+                    if (output.strip() and 
+                        len(output) > 30 and 
+                        not any(err in output.lower() for err in ["error", "failed", "cannot"])):
+                        
+                        execution_time = time.time() - start_time
+                        tracker.log_query(query, "MEDIUM", "ollama", True, execution_time)
+                        return f"Ollama Analysis:\n\n{output}", "ollama"
+                except (OutputParserException, ValueError) as e:
+                    st.info(f"Ollama parsing failed: {stringify_exception(e)}")
+            else:
+                st.info("Ollama agent creation failed → Trying Pandas Agent...")
         except Exception as e:
-            st.info(f"Ollama failed ({stringify_exception(e)}) → Trying Pandas Agent…")
+            st.info(f"Ollama setup failed: {stringify_exception(e)} → Trying Pandas Agent...")
 
-    # 2. Fallback → Pandas Agent
+    # 2. Try Pandas Agent
     try:
         pandas_res = run_pandas_agent(query, df, gemini_llm=gemini_llm, ollama_llm=ollama_llm)
         if pandas_res and len(pandas_res.strip()) > 20:
+            pandas_res = clean_gemini_response(pandas_res)
             execution_time = time.time() - start_time
             tracker.log_query(query, "MEDIUM", "pandas-agent", True, execution_time)
             return f"Pandas Agent Analysis:\n\n{pandas_res}", "pandas-agent"
-        else:
-            st.info("Pandas Agent returned minimal output → Trying Gemini…")
-    except Exception as e:
-        st.info(f"Pandas Agent failed ({stringify_exception(e)}) → Trying Gemini…")
+    except Exception:
+        st.info("Pandas Agent failed → Using enhanced fallback...")
 
-    # 3. Final fallback → Gemini (delegates to complex path) - WITH CLEANING
-    if gemini_llm:
-        try:
-            prompt = preprocess_query_for_llm(query, df, "GEMINI", schema)
-            agent = create_gemini_agent(df, gemini_llm)
-            if agent:
-                with st.spinner("Gemini analyzing..."):
-                    res = agent.invoke({"input": prompt})
-                output = safe_extract_output(res)
-                
-                # CLEAN GEMINI RESPONSE HERE TOO
-                output = clean_gemini_response(output)
-                
-                if output.strip() and len(output) > 30:
-                    execution_time = time.time() - start_time
-                    tracker.log_query(query, "MEDIUM", "gemini", True, execution_time)
-                    return f"Gemini Fallback Analysis:\n\n{output}", "gemini"
-        except Exception as e:
-            st.warning(f"Gemini fallback failed: {stringify_exception(e)}")
-    
-    # 4. Ultimate fallback
+    # 3. Final fallback
     execution_time = time.time() - start_time
     tracker.log_query(query, "MEDIUM", "fallback", False, execution_time)
     return enhanced_fallback_analysis(df, query, schema), "fallback"
+
+# ---------- Add Debug Function for Ollama Testing ----------
+
+def test_ollama_connection(ollama_llm) -> bool:
+    """Test if Ollama is actually working"""
+    if not ollama_llm:
+        return False
+    try:
+        test_response = ollama_llm.invoke("Say 'TEST SUCCESS' if you can read this.")
+        response_text = safe_extract_output(test_response)
+        return "TEST SUCCESS" in response_text.upper()
+    except Exception as e:
+        st.warning(f"Ollama connection test failed: {stringify_exception(e)}")
+        return False
 
 # ---------- Updated Execute Complex Strategy (with chart validation) ----------
 
