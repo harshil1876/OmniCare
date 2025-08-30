@@ -577,58 +577,143 @@ def create_gemini_agent(df: pd.DataFrame, gemini_llm: ChatGoogleGenerativeAI):
 # ---------- Query routing with schema-aware classification ----------
 
 def classify_query_complexity(query: str, schema: Dict) -> str:
-    """Enhanced classification using schema information"""
-    q = query.lower()
-
+    """Enhanced classification using schema information with improved pattern matching"""
+    # Normalize query for better matching
+    q = query.lower().strip()
+    q = ' '.join(q.split())  # Normalize whitespace
+    
     # Schema-aware indicators
     business_entities = schema.get('primary_business_entities', []) or []
     business_metrics = schema.get('business_metrics', []) or []
     
-    # Chart/visualization queries are ALWAYS complex (routed to Gemini)
-    chart_keywords = ['chart', 'plot', 'graph', 'visuali', 'pie', 'bar', 'histogram', 'scatter', 'line chart']
-    if any(keyword in q for keyword in chart_keywords):
-        return "COMPLEX"
+    # Prepare normalized business metrics for matching
+    normalized_metrics = [metric.lower() for metric in business_metrics]
     
-    basic_indicators = [
-        "head", "first", "show", "display", "columns", "shape", "size",
-        "describe", "info", "summary", "list", "what are", "how many",
-        "unique", "value counts", "schema"
-    ]
+    # Simple pattern matchers
+    def fuzzy_match(pattern: str, text: str) -> bool:
+        """Simple fuzzy matching for common variations"""
+        pattern = pattern.lower()
+        text = text.lower()
+        # Handle common typos and variations
+        variations = [
+            pattern,
+            pattern.replace(' ', ''),  # Remove spaces
+            ''.join(c for c in pattern if c.isalnum()),  # Alphanumeric only
+        ]
+        return any(var in text for var in variations)
     
-    complex_indicators = [
-        "analyze", "insights", "trends", "patterns", "correlations",
-        "predictions", "recommendations", "optimize", "compare", "contrast",
-        "what if", "scenario", "forecast", "model", "relationship",
-        "anomal", "outlier", "cluster", "segment", "classify", "predict",
-        "regression", "time series", "seasonality"
-    ]
+    # Define query patterns with variations
+    SIMPLE_PATTERNS = {
+        'basic_stats': [
+            r'total [\w\s]+ for',  # Specific column totals
+            r'sum of [\w\s]+',
+            r'show me [\w\s]+ total',
+            r'what is the total',
+            r'calculate total',
+        ],
+        'data_view': [
+            r'show|display|list|get',
+            r'what are|what is',
+            r'give me',
+        ],
+        'basic_info': [
+            r'shape|size|count|length',
+            r'columns|schema|structure',
+        ]
+    }
     
-    moderate_indicators = [
-        "total", "sum", "average", "mean", "max", "min", "count",
-        "group by", "filter", "where", "sort", "rank", "top", "bottom",
-        "calculate", "compute", "find", "search", "get", " by "
-    ]
-
-    # Enhanced detection using schema
+    MEDIUM_PATTERNS = {
+        'aggregations': [
+            r'total by|sum by|average by',
+            r'group|aggregate',
+            r'breakdown of',
+            r'distribution of',
+        ],
+        'filtering': [
+            r'filter|where|which|when',
+            r'find all|show all|get all',
+            r'greater than|less than|between',
+        ],
+        'rankings': [
+            r'top \d+|bottom \d+',
+            r'highest|lowest',
+            r'best|worst',
+        ]
+    }
+    
+    COMPLEX_PATTERNS = {
+        'analysis': [
+            r'analyze|analyse|analysis',
+            r'insight|pattern|trend',
+            r'correlation|relationship',
+            r'predict|forecast|estimate',
+            r'describe|elaborate|explain|detail',
+        ],
+        'visualization': [
+            r'chart|plot|graph|visual',
+            r'pie|bar|histogram|scatter',
+        ],
+        'advanced': [
+            r'compare|contrast|versus|vs',
+            r'impact of|effect of',
+            r'segment|cluster|classify',
+            r'month over month|year over year',
+            r'over time|time series',
+        ]
+    }
+    
+    # Check for specific simple cases first (exact matches with business metrics)
+    for metric in normalized_metrics:
+        simple_metric_patterns = [
+            f"total {metric}",
+            f"sum of {metric}",
+            f"show {metric}",
+            f"{metric} total",
+        ]
+        if any(fuzzy_match(pattern, q) for pattern in simple_metric_patterns):
+            return "SIMPLE"
+    
+    # Visualization queries are always complex
+    for pattern in COMPLEX_PATTERNS['visualization']:
+        if fuzzy_match(pattern, q):
+            return "COMPLEX"
+    
+    # Check for multiple entity/metric mentions
     mentions_multiple_entities = sum(1 for entity in business_entities if entity.lower() in q) > 1
     mentions_multiple_metrics = sum(1 for metric in business_metrics if metric.lower() in q) > 1
-    has_comparison_words = any(word in q for word in [" vs ", "versus", "compare", "against", " between "])
-    has_time_analysis = any(word in q for word in ["trend", "over time", "growth", "change", "month over month", "year over year"])
-
-    # Classification logic
-    if any(x in q for x in complex_indicators) or has_comparison_words or has_time_analysis:
-        return "COMPLEX"
-    if any(x in q for x in basic_indicators) and not (mentions_multiple_entities or mentions_multiple_metrics):
-        return "SIMPLE"
+    
     if mentions_multiple_entities or mentions_multiple_metrics:
         return "COMPLEX"
-    if any(x in q for x in moderate_indicators):
-        return "MEDIUM"
-
-    # Fallback heuristic
-    if len(query.split()) > 12:
+    
+    # Check for time-based analysis
+    time_patterns = [
+        r'trend', r'over time', r'growth', r'change',
+        r'month', r'year', r'daily', r'weekly'
+    ]
+    if any(fuzzy_match(pattern, q) for pattern in time_patterns):
         return "COMPLEX"
-    return "SIMPLE"
+    
+    # Check pattern categories
+    for patterns in COMPLEX_PATTERNS.values():
+        if any(fuzzy_match(pattern, q) for pattern in patterns):
+            return "COMPLEX"
+    
+    for patterns in MEDIUM_PATTERNS.values():
+        if any(fuzzy_match(pattern, q) for pattern in patterns):
+            return "MEDIUM"
+    
+    for patterns in SIMPLE_PATTERNS.values():
+        if any(fuzzy_match(pattern, q) for pattern in patterns):
+            return "SIMPLE"
+    
+    # Length-based fallback
+    words = q.split()
+    if len(words) > 12 or len(q) > 100:
+        return "COMPLEX"
+    if len(words) > 6:
+        return "MEDIUM"
+    
+    return "SIMPLE"  # Default to simple for short, unclassified queries
 
 def preprocess_query_for_llm(query: str, df: pd.DataFrame, llm_type: str, schema: Dict) -> str:
     """Enhanced preprocessing with schema context and chart handling"""
