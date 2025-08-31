@@ -60,6 +60,52 @@ def stringify_exception(e: Exception, limit: int = 140) -> str:
     msg = f"{type(e).__name__}: {str(e)}"
     return (msg[:limit] + "...") if len(msg) > limit else msg
 
+def standardize_agent_response(raw_output: str, query: str, execution_path: str) -> str:
+    """Ensure all agent responses follow consistent format"""
+    if not raw_output or len(raw_output.strip()) < 5:
+        return raw_output
+    
+    # Skip if already well-formatted
+    if "**" in raw_output or "|" in raw_output:
+        return raw_output
+    
+    # Check for raw number output
+    lines = raw_output.strip().split('\n')
+    try:
+        if len(lines) == 1:
+            float(raw_output.strip())
+            return f"""**Analysis Result:**
+
+The answer to "{query}" is: **{raw_output.strip()}**
+
+**Context:**
+- Method: {execution_path.title()} processing
+- Result type: Single aggregate value"""
+    except ValueError:
+        pass
+    
+    # Enhance minimal responses
+    if (len(lines) <= 3 and 
+        not any(word in raw_output.lower() for word in ['analysis', 'result', 'interpretation'])):
+        return f"""**Analysis Result:**
+
+{raw_output}
+
+**Summary:** Analysis completed successfully via {execution_path.title()}."""
+    
+    return raw_output
+
+def enhance_query_for_consistency(query: str, complexity: str) -> str:
+    """Add formatting requirements to queries"""
+    format_req = """
+
+Please format your response professionally:
+- Explain what you're calculating
+- Present results clearly (tables for groups, context for single values)
+- Add brief interpretation"""
+    
+    return f"{query}{format_req}"
+
 # ---------- Audit & Tracking ----------
 class QueryTracker:
     def __init__(self):
@@ -115,6 +161,31 @@ class SchemaManager:
         if 'detected_schema' not in st.session_state:
             st.session_state.detected_schema = None
     
+    def _clean_llm_json(self, text: str) -> str:
+        """Clean LLM output to get valid JSON"""
+        # Find JSON-like content between curly braces
+        json_match = re.search(r'\{[\s\S]*\}', text)
+        if not json_match:
+            return ""
+        
+        json_str = json_match.group()
+        
+        # Fix common JSON formatting issues:
+        # 1. Fix unquoted property names
+        json_str = re.sub(r'(\s*)([\w_]+)(\s*):([^"])', r'\1"\2"\3:\4', json_str)
+        
+        # 2. Fix single quotes to double quotes (handle both keys and values)
+        json_str = re.sub(r"'([^']*)':", r'"\1":', json_str)
+        json_str = re.sub(r":\s*'([^']*)'", r':"\1"', json_str)
+        
+        # 3. Remove trailing commas in arrays/objects
+        json_str = re.sub(r',(\s*[}\]])', r'\1', json_str)
+        
+        # 4. Ensure string values are properly quoted
+        json_str = re.sub(r':\s*([^"{}\[\],\s][^,}\]]*)', r':"\1"', json_str)
+        
+        return json_str
+
     def detect_schema_with_llm(self, df: pd.DataFrame, ollama_llm, gemini_llm) -> Dict:
         """Use LLM to intelligently detect and categorize DataFrame schema"""
         
@@ -123,11 +194,12 @@ class SchemaManager:
         if not llm:
             return self._fallback_schema_detection(df)
         
-        # Create schema detection prompt
+        # Create schema detection prompt with stronger formatting guidance
         sample_data = df.head(3).to_string(index=False, max_cols=10)
         dtypes_info = {col: str(dtype) for col, dtype in df.dtypes.items()}
         
-        schema_prompt = f"""Analyze this DataFrame and provide a JSON schema classification:
+        schema_prompt = f"""Return ONLY a JSON object (no other text) that classifies this DataFrame's schema.
+Use ONLY double quotes for all property names and string values.
 
 DataFrame Info:
 - Shape: {df.shape[0]} rows × {df.shape[1]} columns
@@ -136,31 +208,47 @@ DataFrame Info:
 Sample Data:
 {sample_data}
 
-Please return ONLY a valid JSON with this structure:
+Return this exact structure with real column names from the data:
 {{
-    "numeric_columns": ["list of numeric columns for calculations"],
+    "numeric_columns": ["list of numeric columns"],
     "categorical_columns": ["list of text/categorical columns"],
-    "date_columns": ["list of date/datetime columns"],
-    "id_columns": ["list of ID/identifier columns"],
-    "business_metrics": ["list of business KPI columns like sales, revenue, etc"],
-    "groupby_candidates": ["list of columns good for grouping/segmentation"],
-    "primary_business_entities": ["main entities like product, customer, region"],
-    "schema_insights": "Brief description of what this dataset represents"
+    "date_columns": ["list of date columns"],
+    "id_columns": ["list of ID columns"],
+    "business_metrics": ["list of KPI columns like sales, revenue"],
+    "groupby_candidates": ["list of grouping columns"],
+    "primary_business_entities": ["main entities"],
+    "schema_insights": "brief dataset description"
 }}"""
+
         try:
+            # Get LLM response
             if gemini_llm:
                 response = gemini_llm.invoke(schema_prompt)
             else:
                 response = ollama_llm.invoke(schema_prompt)
             
+            # Extract and clean the response
             response_text = safe_extract_output(response)
-            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-            if json_match:
-                schema = json.loads(json_match.group())
-                st.session_state.detected_schema = schema
-                return schema
+            cleaned_json = self._clean_llm_json(response_text)
+            
+            if cleaned_json:
+                try:
+                    schema = json.loads(cleaned_json)
+                    
+                    # Validate schema structure
+                    required_keys = ["numeric_columns", "categorical_columns", "date_columns", 
+                                  "business_metrics", "groupby_candidates", "schema_insights"]
+                    
+                    if all(key in schema for key in required_keys):
+                        st.session_state.detected_schema = schema
+                        return schema
+                    else:
+                        st.info("Schema missing required fields → Using fallback")
+                except json.JSONDecodeError:
+                    st.info("Failed to parse schema JSON → Using fallback")
+            
         except Exception as e:
-            st.info(f"LLM schema detection failed: {stringify_exception(e)} -> Using fallback")
+            st.info(f"LLM schema detection failed: {stringify_exception(e)} → Using fallback")
         
         # Fallback to rule-based detection
         return self._fallback_schema_detection(df)
@@ -306,12 +394,16 @@ def create_ollama_agent(df: pd.DataFrame, ollama_llm: OllamaLLM):
         return create_pandas_dataframe_agent(
             llm=ollama_llm,
             df=df,
-            verbose=True,  # Changed to True for debugging
+            verbose=True,
             allow_dangerous_code=True,
             handle_parsing_errors=True,
-            max_iterations=100,  # Reduced from 100 to prevent long waits
+            max_iterations=30,
             agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
             return_intermediate_steps=False,
+            # Add consistent system message
+            agent_kwargs={
+                "system_message": "You are a data analyst. Always provide well-formatted, explained responses. Don't return raw numbers without context."
+            }
         )
     except Exception as e:
         st.warning(f"Ollama agent creation failed: {stringify_exception(e)}")
@@ -324,16 +416,57 @@ def create_gemini_agent(df: pd.DataFrame, gemini_llm: ChatGoogleGenerativeAI):
         return create_pandas_dataframe_agent(
             llm=gemini_llm,
             df=df,
-            verbose=True,  # Changed to True for debugging
+            verbose=True,
             allow_dangerous_code=True,
             handle_parsing_errors=True,
-            max_iterations=100,  # Reduced from 100 to prevent long waits
+            max_iterations=30,
             agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
             return_intermediate_steps=False,
+            # Add consistent system message
+            agent_kwargs={
+                "system_message": "You are a senior data analyst. Always provide professional, well-formatted responses with context and interpretation. Present grouped data in tables."
+            }
         )
     except Exception as e:
         st.warning(f"Gemini agent creation failed: {stringify_exception(e)}")
         return None
+
+# Enhanced output validation and post-processing
+def enhance_agent_output(raw_output: str, query: str, df: pd.DataFrame) -> str:
+    """Post-process agent output to ensure consistent formatting"""
+    if not raw_output or len(raw_output.strip()) < 10:
+        return raw_output
+    
+    # Check if output is just a raw number
+    try:
+        # If the output is just a number, enhance it
+        float(raw_output.strip())
+        # It's a raw number - add context
+        return f"""**Query Result:**
+
+The answer to "{query}" is: **{raw_output.strip()}**
+
+**Context:**
+- Dataset: {df.shape[0]} rows × {df.shape[1]} columns
+- Calculation: Direct numerical result from pandas operation
+- Result type: Single aggregate value"""
+        
+    except ValueError:
+        # Not a raw number, check if it needs table formatting
+        lines = raw_output.strip().split('\n')
+        
+        # If output contains multiple data rows but no proper formatting
+        if len(lines) > 3 and not any('|' in line or '**' in line for line in lines):
+            # Try to detect if this is grouped data that needs table formatting
+            if any(word in query.lower() for word in ['by', 'each', 'per', 'group']):
+                return f"""**Analysis Results:**
+
+{raw_output}
+
+**Interpretation:**
+This shows the breakdown of your requested analysis across different categories/groups in the dataset."""
+    
+    return raw_output
 
 # ---------- Query Classification System ----------
 
@@ -379,12 +512,22 @@ def classify_query_complexity(query: str, schema: Dict) -> str:
     return "SIMPLE"
 
 def preprocess_query_for_llm(query: str, df: pd.DataFrame, llm_type: str, schema: Dict) -> str:
-    """Enhanced preprocessing with schema context and chart handling"""
+    """Enhanced preprocessing with schema context and consistent formatting"""
     q = query.lower()
     
     # Check if this is a chart query
     chart_keywords = ['chart', 'plot', 'graph', 'visuali', 'pie', 'bar', 'histogram', 'scatter', 'line chart']
     is_chart_query = any(keyword in q for keyword in chart_keywords)
+    
+    # Consistent formatting instructions for both LLM types
+    format_instructions = """
+RESPONSE FORMATTING RULES:
+- Always provide context and explanation with your numerical results
+- For single values: explain what the number represents
+- For grouped/aggregated data: present in clear table format with headers
+- Include brief interpretation of the results
+- Use proper formatting (tables, bullet points) for readability
+"""
     
     if llm_type == "OLLAMA":
         schema_context = f"""
@@ -395,13 +538,16 @@ Schema Info:
 """
         return f"""You are a helpful data analyst. Answer the user's question about the dataset using python/pandas.
 
+{format_instructions}
+
 {schema_context}
 Question: {query}
 
 DataFrame info: {df.shape[0]} rows × {df.shape[1]} columns
 Columns: {list(df.columns)}
 
-Provide a clear, concise answer. Use the python_repl_ast tool to analyze the data when needed."""
+IMPORTANT: Always explain your results and provide context. Don't just return raw numbers.
+Provide a clear, well-formatted answer with interpretation."""
 
     elif llm_type == "GEMINI":
         head_sample = df.head(2).to_string(index=False, max_cols=8)
@@ -436,6 +582,7 @@ plt.close()
         
         return f"""You are a senior data analyst. Provide comprehensive analysis for this question.
 
+{format_instructions}
 {chart_instructions}
 
 Dataset Context: {schema_insights}
@@ -451,9 +598,11 @@ Question: {query}
 
 Please provide:
 1. Direct answer with specific numbers/insights
-2. Business context and interpretation
+2. Business context and interpretation  
 3. Any actionable recommendations (if applicable)
+4. Proper formatting (tables for grouped data, explanations for single values)
 
+IMPORTANT: Always format your responses professionally with context and explanation.
 Use the python_repl_ast tool for complex pandas operations."""
     return query
 
@@ -461,8 +610,7 @@ Use the python_repl_ast tool for complex pandas operations."""
 
 def run_pandas_agent(query: str, df: pd.DataFrame, gemini_llm=None, ollama_llm=None) -> Optional[str]:
     """
-    Execute query using a Pandas agent with consistent response cleaning.
-    Prefers Gemini if available, otherwise Ollama.
+    Execute query using a Pandas agent with enhanced prompting for consistency.
     """
     agent = None
     agent_type = None
@@ -480,14 +628,29 @@ def run_pandas_agent(query: str, df: pd.DataFrame, gemini_llm=None, ollama_llm=N
         
         st.info(f"Using {agent_type} Pandas Agent...")
         
+        # Enhanced query with formatting instructions
+        enhanced_query = f"""
+{query}
+
+RESPONSE FORMAT REQUIREMENTS:
+- Always provide context and explanation with numerical results
+- Format grouped data in clear table format
+- Include brief interpretation of results
+- Don't return raw numbers without explanation
+- Use professional business analysis tone
+"""
+        
         # Execute with timeout protection
         with st.spinner(f"{agent_type} processing..."):
-            res = agent.invoke({"input": query})
+            res = agent.invoke({"input": enhanced_query})
             output = safe_extract_output(res)
             
             # Clean response if it came from Gemini
             if agent_type == "Gemini":
                 output = clean_gemini_response(output)
+            
+            # Apply output enhancement
+            output = enhance_agent_output(output, query, df)
             
             # Validate output quality
             if output and len(output.strip()) > 10:
@@ -585,18 +748,21 @@ def enhanced_fallback_analysis(df: pd.DataFrame, query: str, schema: Dict) -> st
 # ---------- Execution strategies with fallback ----------
 
 def execute_simple_strategy(query: str, df: pd.DataFrame, schema: Dict, ollama_llm, gemini_llm) -> Tuple[str, str]:
-    """Simple queries with proper agent validation"""
+    """Simple queries with consistent output formatting"""
     start_time = time.time()
     
-    # 1. Try Ollama first - CHECK IF AGENT IS CREATED
+    # 1. Try Ollama first with enhanced preprocessing
     if ollama_llm:
         try:
             agent = create_ollama_agent(df, ollama_llm)
-            if agent:  # Only proceed if agent exists
-                simple_prompt = f"Using the dataframe 'df', {query}. Show the result."
+            if agent:
+                enhanced_prompt = preprocess_query_for_llm(query, df, "OLLAMA", schema)
                 try:
-                    res = agent.invoke({"input": simple_prompt})
+                    res = agent.invoke({"input": enhanced_prompt})
                     output = safe_extract_output(res)
+                    
+                    # Enhanced output processing
+                    output = enhance_agent_output(output, query, df)
                     
                     if (output.strip() and 
                         len(output) > 30 and 
@@ -604,7 +770,7 @@ def execute_simple_strategy(query: str, df: pd.DataFrame, schema: Dict, ollama_l
                         
                         execution_time = time.time() - start_time
                         tracker.log_query(query, "SIMPLE", "ollama", True, execution_time)
-                        return f"Ollama Analysis:\n\n{output}", "ollama"
+                        return f"**Ollama Analysis:**\n\n{output}", "ollama"
                 except (OutputParserException, ValueError) as e:
                     st.info(f"Ollama parsing failed: {stringify_exception(e)}")
             else:
@@ -612,14 +778,25 @@ def execute_simple_strategy(query: str, df: pd.DataFrame, schema: Dict, ollama_l
         except Exception as e:
             st.info(f"Ollama setup failed: {stringify_exception(e)} → Trying Pandas Agent...")
 
-    # 2. Try Pandas Agent
+    # 2. Try Pandas Agent with enhanced preprocessing
     try:
-        pandas_res = run_pandas_agent(query, df, gemini_llm=gemini_llm, ollama_llm=ollama_llm)
+        enhanced_query = f"""
+Please analyze: {query}
+
+Instructions:
+- Provide clear explanation with your numerical results
+- Format grouped data as tables
+- Include brief interpretation
+- Don't return raw numbers without context
+"""
+        pandas_res = run_pandas_agent(enhanced_query, df, gemini_llm=gemini_llm, ollama_llm=ollama_llm)
         if pandas_res and len(pandas_res.strip()) > 20:
             pandas_res = clean_gemini_response(pandas_res)
+            pandas_res = enhance_agent_output(pandas_res, query, df)
+            
             execution_time = time.time() - start_time
             tracker.log_query(query, "SIMPLE", "pandas-agent", True, execution_time)
-            return f"Pandas Agent Analysis:\n\n{pandas_res}", "pandas-agent"
+            return f"**Pandas Agent Analysis:**\n\n{pandas_res}", "pandas-agent"
     except Exception:
         st.info("Pandas Agent failed → Using enhanced fallback...")
 
